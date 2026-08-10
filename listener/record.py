@@ -1,20 +1,57 @@
-import numpy as np
+"""Fast endpointing for the mic.
+
+Goes in: listener/record.py  (replaces existing)
+"""
+
 import time
 
-SILENCE_THRESHOLD = 500      # RMS amplitude below this = silence (tune later)
-SILENCE_DURATION = 4.5       # seconds of silence before stopping (gives room to think)
-GRACE_PERIOD = 1.0           # seconds at start where silence is ignored entirely
-MAX_RECORD_SECONDS = 20      # hard cap so it never hangs forever
+import numpy as np
+
+# --- Endpointing -----------------------------------------------------------
+# The old config waited 4.5s of silence after you stopped speaking before it
+# even stopped recording. That one constant was the largest single chunk of
+# the delay before Jarvis said anything.
+#
+# 700ms rides over natural mid-sentence pauses without making you wait.
+SILENCE_HANGOVER = 0.7
+GRACE_PERIOD = 0.35          # ignore silence in the opening moments
+MIN_SPEECH_SECONDS = 0.25    # don't endpoint on a click or a door slam
+MAX_RECORD_SECONDS = 15
+
+# --- Adaptive gating -------------------------------------------------------
+# A fixed RMS threshold breaks both ways: in a noisy room it never endpoints,
+# on a quiet mic it endpoints mid-word. Measure the room during the first few
+# chunks instead and set the speech gate relative to that.
+NOISE_FLOOR_CHUNKS = 6
+SPEECH_MULTIPLIER = 3.0
+MIN_SPEECH_RMS = 250.0
+MAX_SPEECH_RMS = 2000.0
 
 
-def record_until_silence(stream, chunk_size):
-    """Reads from an already-open sounddevice stream (int16, mono)
-    until it detects sustained silence. Does NOT open its own stream —
-    this avoids two streams fighting over the mic."""
+def _rms(block):
+    return float(np.sqrt(np.mean(block.astype(np.float32) ** 2)))
+
+
+def record_until_silence(stream, chunk_size, samplerate=16000, on_endpoint=None):
+    """Reads from an already-open sounddevice stream (int16, mono) until the
+    speaker stops. Returns an int16 numpy array.
+
+    Does NOT open its own stream -- that would make two streams fight over
+    the mic.
+
+    on_endpoint: optional callback fired the instant we decide speech ended,
+    before frames are concatenated.
+    """
     print("Recording... (speak now)")
+
     frames = []
+    noise_samples = []
+    gate = MIN_SPEECH_RMS
+
     silence_start = None
+    speech_seconds = 0.0
     start_time = time.time()
+    chunk_seconds = chunk_size / float(samplerate)
 
     while True:
         data, overflowed = stream.read(chunk_size)
@@ -22,24 +59,38 @@ def record_until_silence(stream, chunk_size):
             print("input overflow (recording)")
 
         frames.append(data.copy())
-
+        level = _rms(data)
         elapsed = time.time() - start_time
-        rms = np.sqrt(np.mean(data.astype(np.float32) ** 2))
 
-        if elapsed < GRACE_PERIOD:
-            pass
-        elif rms < SILENCE_THRESHOLD:
+        # calibrate the gate off the opening chunks
+        if len(noise_samples) < NOISE_FLOOR_CHUNKS:
+            noise_samples.append(level)
+            if len(noise_samples) == NOISE_FLOOR_CHUNKS:
+                floor = float(np.median(noise_samples))
+                gate = min(
+                    MAX_SPEECH_RMS,
+                    max(MIN_SPEECH_RMS, floor * SPEECH_MULTIPLIER),
+                )
+            continue
+
+        if level > gate:
+            speech_seconds += chunk_seconds
+            silence_start = None
+        elif elapsed > GRACE_PERIOD and speech_seconds >= MIN_SPEECH_SECONDS:
             if silence_start is None:
                 silence_start = time.time()
-            elif time.time() - silence_start > SILENCE_DURATION:
+            elif time.time() - silence_start >= SILENCE_HANGOVER:
                 break
-        else:
-            silence_start = None
 
         if elapsed > MAX_RECORD_SECONDS:
             print("Max recording time reached.")
             break
 
-    print("Done recording.")
-    audio = np.concatenate(frames, axis=0)
-    return audio
+    if on_endpoint is not None:
+        try:
+            on_endpoint()
+        except Exception:
+            pass
+
+    print("Done recording ({:.2f}s).".format(time.time() - start_time))
+    return np.concatenate(frames, axis=0)

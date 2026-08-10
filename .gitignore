@@ -7,3 +7,5 @@ screenshots
 venv
 *.env
 !.env.example
+*.zip
+cache

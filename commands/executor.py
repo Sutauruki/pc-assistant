@@ -1,64 +1,46 @@
+"""Action execution.
+
+Goes in: commands/executor.py  (replaces existing)
+
+open_app / close_app now delegate to commands/app_index.py, which builds a
+catalog of what's actually installed instead of relying on the hardcoded
+APP_PATHS / PROCESS_NAMES tables. Those tables are gone -- add nothing here
+when you install new software, it gets picked up by the next scan.
+
+set_volume and take_screenshot are unchanged.
+"""
+
 import os
-import subprocess
 import time
-import psutil
+
 import mss
 import mss.tools
 from pycaw.pycaw import AudioUtilities
 
+from commands import app_index
+
 SCREENSHOTS_DIR = "screenshots"
 
-# Known app -> launch path/command. Add more here as needed.
-APP_PATHS = {
-    "chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    "notepad": "notepad.exe",
-    "calculator": "calc.exe",
-}
-
-# Known app -> actual Windows process name (for closing).
-# Some apps' process name differs from their launch command.
-PROCESS_NAMES = {
-    "chrome": "chrome.exe",
-    "notepad": "notepad.exe",
-    "calculator": "CalculatorApp.exe",  # modern Windows 11 calculator
-}
+# Kick the app scan off now rather than on the first spoken command. This
+# module is imported at startup, so the ~1-3s PowerShell round trip overlaps
+# with loading the wake word model and never lands on the latency path.
+app_index.preload()
 
 
 def open_app(target):
-    target = target.lower().strip()
-    path = APP_PATHS.get(target)
-
-    if path:
-        try:
-            subprocess.Popen(path)
-            msg = f"Opened {target}"
-        except Exception as e:
-            msg = f"Failed to open {target}: {e}"
-    else:
-        try:
-            os.startfile(target)
-            msg = f"Opened {target}"
-        except Exception as e:
-            msg = f"Couldn't open '{target}' — not a known app"
-
+    msg = app_index.open_app(target)
     print(msg)
     return msg
 
 
 def close_app(target):
-    target = target.lower().strip()
-    process_name = PROCESS_NAMES.get(target, f"{target}.exe")
+    msg = app_index.close_app(target)
+    print(msg)
+    return msg
 
-    found = False
-    for proc in psutil.process_iter(["name"]):
-        try:
-            if proc.info["name"] and proc.info["name"].lower() == process_name.lower():
-                proc.terminate()
-                found = True
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
 
-    msg = f"Closed {target}" if found else f"Couldn't find '{target}' running"
+def refresh_apps():
+    msg = app_index.rescan()
     print(msg)
     return msg
 
@@ -110,6 +92,8 @@ def execute_actions(actions):
             results.append(set_volume(action.get("value", 50)))
         elif kind == "take_screenshot":
             results.append(take_screenshot())
+        elif kind == "refresh_apps":
+            results.append(refresh_apps())
         elif kind == "unknown":
             msg = f"Didn't understand: \"{action.get('raw', '')}\""
             print(msg)
