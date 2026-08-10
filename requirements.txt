@@ -1,0 +1,4 @@
+openwakeword
+sounddevice
+numpy
+python-dotenv

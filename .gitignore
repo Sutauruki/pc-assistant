@@ -1,0 +1,9 @@
+idea.txt
+text_*.txt
+models
+__pycache__
+recordings
+screenshots
+venv
+*.env
+!.env.example
