@@ -1,6 +1,6 @@
 """Streaming Groq TTS.
 
-Goes in: listener/tts.py
+Goes in: listener/tts.py   (replaces existing)
 
 Gemini keeps doing transcription in listener/stt_gemini.py -- untouched.
 Speech goes through Groq on a SEPARATE key so TTS volume doesn't burn down
@@ -46,7 +46,16 @@ RESPONSE_FORMAT = "wav"
 #
 # 1.25 reads close to natural for short confirmations. Past ~1.6 the WSOLA
 # seams start to get audible on sibilants.
+#
+# Note this is also what forces the player to buffer: playing at 1.25x drains
+# audio faster than Groq generates it, so audio_out has to hold enough up
+# front to cover the difference. Lowering it makes speech smoother for free.
 SPEECH_SPEED = 1.25
+
+# Rough speaking rate, used only to tell the player how much audio is coming
+# so it can size its prebuffer. Being in the right neighbourhood is enough --
+# audio_out clamps the result, and has a reactive fallback if it's wrong.
+CHARS_PER_SECOND = 14.5
 
 # Orpheus accepts 8000/16000/22050/24000/32000/44100/48000 and defaults to
 # 48000. Pinning it means audio_out never has to reopen the device mid-run,
@@ -288,6 +297,10 @@ def speak(text, on_first_audio=None):
                     samplerate=rate,
                     speed=SPEECH_SPEED,
                     on_first_audio=on_first_audio,
+                    # Lets the player work out how much to hold back before it
+                    # starts, instead of guessing a fixed figure and running
+                    # dry halfway through the sentence.
+                    expected_seconds=len(text) / CHARS_PER_SECOND,
                 )
                 player.start()
 
@@ -295,8 +308,15 @@ def speak(text, on_first_audio=None):
     except Exception as e:
         _explain_failure(e)
     finally:
+        # Guarded because this sits in the `finally`, outside the `try` that
+        # makes speak() safe. An exception raised here would walk straight out
+        # past the handler above and break the never-raises contract the wake
+        # loop depends on.
         if player is not None:
-            player.finish()
+            try:
+                player.finish()
+            except Exception as e:
+                print("tts: playback didn't finish cleanly ({})".format(e))
 
     return player
 

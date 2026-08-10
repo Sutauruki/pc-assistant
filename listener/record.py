@@ -7,6 +7,8 @@ import time
 
 import numpy as np
 
+from listener import ui
+
 # --- Endpointing -----------------------------------------------------------
 # The old config waited 4.5s of silence after you stopped speaking before it
 # even stopped recording. That one constant was the largest single chunk of
@@ -42,6 +44,7 @@ def record_until_silence(stream, chunk_size, samplerate=16000, on_endpoint=None)
     on_endpoint: optional callback fired the instant we decide speech ended,
     before frames are concatenated.
     """
+    ui.set_state(ui.RECORDING)
     print("Recording... (speak now)")
 
     frames = []
@@ -61,6 +64,8 @@ def record_until_silence(stream, chunk_size, samplerate=16000, on_endpoint=None)
         frames.append(data.copy())
         level = _rms(data)
         elapsed = time.time() - start_time
+
+        ui.push_rms(level)
 
         # calibrate the gate off the opening chunks
         if len(noise_samples) < NOISE_FLOOR_CHUNKS:

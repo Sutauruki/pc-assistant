@@ -77,29 +77,52 @@ def take_screenshot():
     return msg
 
 
+def _run_one(action):
+    kind = action.get("action")
+
+    if kind == "open_app":
+        return open_app(action.get("target", ""))
+    if kind == "close_app":
+        return close_app(action.get("target", ""))
+    if kind == "set_volume":
+        return set_volume(action.get("value", 50))
+    if kind == "take_screenshot":
+        return take_screenshot()
+    if kind == "refresh_apps":
+        return refresh_apps()
+    if kind == "unknown":
+        msg = f"Didn't understand: \"{action.get('raw', '')}\""
+    else:
+        msg = f"Unrecognized action type: {kind}"
+
+    print(msg)
+    return msg
+
+
 def execute_actions(actions):
     """Takes the list of parsed action dicts, runs each one, and returns
-    a list of result message strings (used to generate a spoken reply)."""
+    a list of result message strings (used to generate a spoken reply).
+
+    Each action is isolated. "Close notepad and close task manager" used to
+    lose *both* results when the second one raised -- the exception unwound
+    the whole loop, so the successful Notepad close was discarded along with
+    it and the turn went by in silence.
+    """
     results = []
     for action in actions:
-        kind = action.get("action")
+        # Read the kind up front. Doing it inside the except block means a
+        # malformed action -- anything that isn't a dict -- raises the same
+        # AttributeError a second time from the handler, which throws away
+        # the isolation this loop exists to provide.
+        try:
+            kind = action.get("action")
+        except AttributeError:
+            kind = None
 
-        if kind == "open_app":
-            results.append(open_app(action.get("target", "")))
-        elif kind == "close_app":
-            results.append(close_app(action.get("target", "")))
-        elif kind == "set_volume":
-            results.append(set_volume(action.get("value", 50)))
-        elif kind == "take_screenshot":
-            results.append(take_screenshot())
-        elif kind == "refresh_apps":
-            results.append(refresh_apps())
-        elif kind == "unknown":
-            msg = f"Didn't understand: \"{action.get('raw', '')}\""
-            print(msg)
-            results.append(msg)
-        else:
-            msg = f"Unrecognized action type: {kind}"
+        try:
+            results.append(_run_one(action))
+        except Exception as e:
+            msg = "Failed to {}: {}".format(kind or "run that", e)
             print(msg)
             results.append(msg)
 

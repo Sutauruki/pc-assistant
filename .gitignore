@@ -9,3 +9,4 @@ venv
 !.env.example
 *.zip
 cache
+*.md
