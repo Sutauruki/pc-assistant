@@ -7,10 +7,24 @@ of what's actually installed instead of relying on hardcoded APP_PATHS /
 PROCESS_NAMES tables. Those tables are gone -- add nothing here when you
 install new software, it gets picked up by the next scan.
 
-New this round: the window actions, in commands/window_actions.py. Note the
-split of responsibility -- close_app kills a process, close_window is not
-offered at all, and everything here only moves windows around. Nothing in the
-window path can end a program, which is why it needs no protected list.
+This round adds files, clipboard, notifications and raw shell. The dispatch
+table is now long enough to be worth saying what it deliberately is NOT: there
+is no policy in this file. Whether a delete is safe lives in commands/paths.py,
+whether a command may run lives in commands/cmd_control.py, and whether
+something needs asking first lives in commands/confirm.py. This module reads a
+dict and calls a function. Keeping it that way is what makes the safety
+properties reviewable -- they are in three small files, not spread through a
+twenty-branch if-chain.
+
+TWO THINGS TO KNOW ABOUT THE RETURN STRINGS
+-------------------------------------------
+1. main.py scans them for "failed", "couldn't" and "didn't" to decide whether
+   to spend a second model round trip on a spoken correction. Every failure
+   message must contain one of those words and no success message may.
+
+2. An action that parks a confirmation returns the *question*, not a result.
+   The caller finds out by asking commands/confirm.is_pending(), not by
+   inspecting the string.
 """
 
 import os
@@ -21,6 +35,12 @@ import mss.tools
 from pycaw.pycaw import AudioUtilities
 
 from commands import app_index
+from commands import clipboard_actions
+from commands import cmd_control
+from commands import file_actions
+from commands import locate
+from commands import memory
+from commands import notify as notifications
 from commands import window_actions
 
 SCREENSHOTS_DIR = "screenshots"
@@ -81,47 +101,175 @@ def take_screenshot():
     return msg
 
 
-def _window_action(fn, *args):
+def _call(fn, *args):
+    """Call it, log it, hand the string back. Every action module already
+    returns a spoken-English result string, so there is nothing else to do."""
     msg = fn(*args)
     print(msg)
     return msg
 
 
+def _first(action, *keys, default=""):
+    """First non-empty value among `keys`.
+
+    The model is consistent about the schema roughly nine times in ten. The
+    tenth writes "target" where the prompt asked for "source", or "query"
+    where it asked for "target". Accepting both spellings costs one line here
+    and saves a whole failed turn -- and unlike a retry, it costs nothing when
+    the model got it right.
+    """
+    for key in keys:
+        value = action.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return default
+
+
 def _run_one(action):
     kind = action.get("action")
 
+    # --- apps ---------------------------------------------------------------
     if kind == "open_app":
-        return open_app(action.get("target", ""))
+        return open_app(_first(action, "target", "app", "name"))
     if kind == "close_app":
-        return close_app(action.get("target", ""))
+        return close_app(_first(action, "target", "app", "name"))
     if kind == "set_volume":
-        return set_volume(action.get("value", 50))
+        return set_volume(_first(action, "value", "level", default=50))
     if kind == "take_screenshot":
         return take_screenshot()
     if kind == "refresh_apps":
         return refresh_apps()
 
+    # --- windows ------------------------------------------------------------
     if kind == "focus_window":
-        return _window_action(window_actions.focus, action.get("target", ""))
+        return _call(window_actions.focus, action.get("target", ""))
     if kind == "minimize_window":
-        return _window_action(window_actions.minimize, action.get("target", ""))
+        return _call(window_actions.minimize, action.get("target", ""))
     if kind == "maximize_window":
-        return _window_action(window_actions.maximize, action.get("target", ""))
+        return _call(window_actions.maximize, action.get("target", ""))
     if kind == "restore_window":
         # No target is meaningful here -- it means "put back what you just
         # minimized" -- so this one passes None through rather than "".
-        return _window_action(window_actions.restore, action.get("target") or None)
+        return _call(window_actions.restore, action.get("target") or None)
     if kind == "arrange_windows":
         targets = action.get("targets") or None
         if isinstance(targets, str):
             # The model occasionally emits a bare string where the shape asks
             # for a list. Cheaper to accept it than to spend a retry on it.
             targets = [targets]
-        return _window_action(
+        return _call(
             window_actions.arrange, action.get("layout", "grid"), targets
         )
     if kind == "list_windows":
-        return _window_action(window_actions.list_windows)
+        return _call(window_actions.list_windows)
+
+    # --- files --------------------------------------------------------------
+    if kind == "move_file":
+        return _call(
+            file_actions.move,
+            _first(action, "source", "target", "file"),
+            _first(action, "destination", "dest", "to", "folder"),
+        )
+    if kind == "copy_file":
+        return _call(
+            file_actions.copy,
+            _first(action, "source", "target", "file"),
+            _first(action, "destination", "dest", "to", "folder"),
+        )
+    if kind == "rename_file":
+        return _call(
+            file_actions.rename,
+            _first(action, "target", "source", "file"),
+            _first(action, "name", "new_name", "to", "destination"),
+        )
+    if kind == "delete_file":
+        return _call(
+            file_actions.delete, _first(action, "target", "source", "file")
+        )
+    if kind == "organize_folder":
+        return _call(
+            file_actions.organize,
+            _first(action, "target", "folder", "path"),
+            _first(action, "by", "mode", default="type"),
+        )
+    if kind == "make_folder":
+        return _call(
+            file_actions.make_folder,
+            _first(action, "target", "name", "folder", "path"),
+        )
+    if kind == "list_files":
+        return _call(
+            file_actions.list_files, _first(action, "target", "folder", "path")
+        )
+    if kind == "find_file":
+        return _call(
+            file_actions.find,
+            _first(action, "query", "target", "name"),
+            _first(action, "where", "folder", "in", default=None) or None,
+        )
+    if kind == "open_path":
+        return _call(
+            file_actions.open_path, _first(action, "target", "path", "file")
+        )
+    if kind == "where_is":
+        return _call(
+            locate.where_is, _first(action, "target", "query", "name", "app")
+        )
+
+    # --- clipboard ----------------------------------------------------------
+    if kind == "read_clipboard":
+        return _call(clipboard_actions.read)
+    if kind == "write_clipboard":
+        return _call(
+            clipboard_actions.write, _first(action, "text", "content", "value")
+        )
+    if kind == "append_clipboard":
+        return _call(
+            clipboard_actions.append, _first(action, "text", "content", "value")
+        )
+    if kind == "clear_clipboard":
+        return _call(clipboard_actions.clear)
+    if kind == "open_link":
+        return _call(clipboard_actions.open_link)
+
+    # --- notifications ------------------------------------------------------
+    if kind == "notify":
+        return _call(
+            notifications.notify,
+            _first(action, "title", "heading", default="Jarvis"),
+            _first(action, "message", "body", "text"),
+        )
+
+    # --- memory -------------------------------------------------------------
+    if kind in ("set_preference", "remember_preference", "save_preference"):
+        return _call(
+            memory.remember_preference,
+            _first(action, "text", "preference", "value", "content"),
+        )
+    if kind in ("forget_preference", "remove_preference"):
+        # No _first default: an empty text means "forget everything", and that
+        # branch is inside forget_preference where it can say how many went.
+        return _call(
+            memory.forget_preference,
+            _first(action, "text", "preference", "value", default=""),
+        )
+    if kind in ("remember_this", "remember", "note_this"):
+        return _call(
+            memory.remember_session,
+            _first(action, "text", "fact", "value", "content"),
+        )
+    if kind in ("list_memory", "what_do_you_remember", "show_memory"):
+        return _call(memory.describe)
+
+    # --- shell --------------------------------------------------------------
+    if kind == "run_command":
+        return _call(
+            cmd_control.run, _first(action, "command", "cmd", "text")
+        )
+    if kind == "explain_command":
+        return _call(
+            cmd_control.explain, _first(action, "command", "cmd", "text")
+        )
 
     if kind == "unknown":
         msg = f"Didn't understand: \"{action.get('raw', '')}\""

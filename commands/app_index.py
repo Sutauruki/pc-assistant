@@ -57,6 +57,15 @@ from ctypes import wintypes
 
 import psutil
 
+# The "don't kill Jarvis's own host" guard. Imported defensively so a missing
+# file degrades to the old ancestor-only behaviour instead of taking the whole
+# app index down at import time.
+try:
+    from commands import self_guard
+except Exception:  # pragma: no cover - only if the file wasn't copied over
+    self_guard = None
+    print("app index: self_guard missing -- close_app is running unprotected")
+
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
@@ -1180,6 +1189,13 @@ def _start_appid(entry):
 # ---------------------------------------------------------------------------
 
 def _self_pids():
+    """This process and its ancestor chain.
+
+    Kept, but it is no longer the real protection -- see self_guard.py. An
+    ancestor set cannot contain the sibling processes of a multi-process app,
+    which is exactly what needed protecting. This now covers the narrow case
+    (our own PID, our direct parents) and self_guard covers the broad one.
+    """
     pids = set([os.getpid()])
     try:
         for parent in psutil.Process().parents():
@@ -1190,13 +1206,29 @@ def _self_pids():
 
 
 def _safe_to_kill(proc, protected_pids):
+    """False for anything that would take Jarvis down with it.
+
+    Three rails, cheapest first: the ancestor PIDs, the OS process list, then
+    self_guard's executable match. That last one is the one that matters --
+    it is what makes every Code.exe untouchable rather than just the one that
+    happens to be our parent.
+
+    This is a backstop. close_app filters through self_guard before it ever
+    calls _terminate, because a refusal it can explain out loud is better than
+    a silent skip. But _terminate also walks children recursively, and a child
+    of a legitimate target can still turn out to be one of ours, so the check
+    belongs here too.
+    """
     try:
         if proc.pid in protected_pids or proc.pid <= 4:
             return False
-        return (proc.name() or "").lower() not in _PROTECTED
+        if (proc.name() or "").lower() in _PROTECTED:
+            return False
+        if self_guard is not None and self_guard.is_protected(proc):
+            return False
+        return True
     except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
         return False
-
 
 def _tracked_pids(key):
     with _launched_lock:
@@ -1448,6 +1480,34 @@ def close_app(spoken):
         if not pids:
             continue
 
+        # Drop anything that would kill Jarvis itself, and note why.
+        if self_guard is not None:
+            try:
+                pids, refused = self_guard.filter_pids(pids)
+            except Exception as e:
+                # A guard that malfunctions must not fail open. Refusing the
+                # close costs the user one manual click; failing open cost
+                # them their editor session once already.
+                print("app index: self-guard failed ({}) -- refusing".format(e))
+                return "Couldn't close {} -- my safety check didn't run".format(
+                    label
+                )
+
+            if not pids:
+                # Everything that matched was one of ours. STOP -- do not fall
+                # through to the next strategy. This strategy found the right
+                # processes and they are off limits; the remaining strategies
+                # are fuzzier, so continuing means killing something less
+                # likely to be what was asked for. That fall-through is how
+                # "close Claude Code" reached VS Code.
+                print("app index: {} matched only protected processes".format(how))
+                return (
+                    "Couldn't close {} -- {}, so closing it would shut me down"
+                    " too. Close it yourself and I'll keep running.".format(
+                        label, refused or "it's my own host"
+                    )
+                )
+
         try:
             killed, survived = _terminate(pids)
         except Exception as e:
@@ -1518,6 +1578,12 @@ def explain(spoken, top=5):
 
 if __name__ == "__main__":
     import sys
+
+    if self_guard is not None:
+        print(self_guard.describe())
+        print()
+    else:
+        print("!! self_guard not importable -- close_app is unprotected\n")
 
     _ensure_catalog()
     if len(sys.argv) > 1:
