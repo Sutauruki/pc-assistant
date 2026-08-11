@@ -2,12 +2,15 @@
 
 Goes in: commands/executor.py  (replaces existing)
 
-open_app / close_app now delegate to commands/app_index.py, which builds a
-catalog of what's actually installed instead of relying on the hardcoded
-APP_PATHS / PROCESS_NAMES tables. Those tables are gone -- add nothing here
-when you install new software, it gets picked up by the next scan.
+open_app / close_app delegate to commands/app_index.py, which builds a catalog
+of what's actually installed instead of relying on hardcoded APP_PATHS /
+PROCESS_NAMES tables. Those tables are gone -- add nothing here when you
+install new software, it gets picked up by the next scan.
 
-set_volume and take_screenshot are unchanged.
+New this round: the window actions, in commands/window_actions.py. Note the
+split of responsibility -- close_app kills a process, close_window is not
+offered at all, and everything here only moves windows around. Nothing in the
+window path can end a program, which is why it needs no protected list.
 """
 
 import os
@@ -18,6 +21,7 @@ import mss.tools
 from pycaw.pycaw import AudioUtilities
 
 from commands import app_index
+from commands import window_actions
 
 SCREENSHOTS_DIR = "screenshots"
 
@@ -77,6 +81,12 @@ def take_screenshot():
     return msg
 
 
+def _window_action(fn, *args):
+    msg = fn(*args)
+    print(msg)
+    return msg
+
+
 def _run_one(action):
     kind = action.get("action")
 
@@ -90,6 +100,29 @@ def _run_one(action):
         return take_screenshot()
     if kind == "refresh_apps":
         return refresh_apps()
+
+    if kind == "focus_window":
+        return _window_action(window_actions.focus, action.get("target", ""))
+    if kind == "minimize_window":
+        return _window_action(window_actions.minimize, action.get("target", ""))
+    if kind == "maximize_window":
+        return _window_action(window_actions.maximize, action.get("target", ""))
+    if kind == "restore_window":
+        # No target is meaningful here -- it means "put back what you just
+        # minimized" -- so this one passes None through rather than "".
+        return _window_action(window_actions.restore, action.get("target") or None)
+    if kind == "arrange_windows":
+        targets = action.get("targets") or None
+        if isinstance(targets, str):
+            # The model occasionally emits a bare string where the shape asks
+            # for a list. Cheaper to accept it than to spend a retry on it.
+            targets = [targets]
+        return _window_action(
+            window_actions.arrange, action.get("layout", "grid"), targets
+        )
+    if kind == "list_windows":
+        return _window_action(window_actions.list_windows)
+
     if kind == "unknown":
         msg = f"Didn't understand: \"{action.get('raw', '')}\""
     else:

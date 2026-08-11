@@ -28,8 +28,9 @@ load_dotenv()
 
 MODEL_NAME = "canopylabs/orpheus-v1-english"
 
-# Voices differ in natural pace as well as timbre -- if 'autumn' still drags
-# after the speed bump below, 'austin' and 'daniel' read noticeably brisker.
+# Voices differ in natural pace as well as timbre -- if 'autumn' still drags,
+# 'austin' and 'daniel' read noticeably brisker at the same stretch factor,
+# which is the free way to sound quicker without asking the player for it.
 # Full set: autumn, diana, hannah, austin, daniel, troy
 VOICE_NAME = "autumn"
 
@@ -38,24 +39,43 @@ RESPONSE_FORMAT = "wav"
 # Playback rate, applied locally in audio_out via pitch-preserving WSOLA.
 #
 # The `speed` field in the Groq SDK signature is a no-op for Orpheus -- the
-# model accepts it and ignores it, which is why setting it changed nothing.
-# Groq's own answer is inline "[fast paced]" tags, but the docs admit the
-# model applies unrecognised directions inconsistently, and a tag that
-# sometimes works isn't much use on every reply. Stretching the samples
-# ourselves is deterministic and costs ~1ms per chunk.
+# model accepts it and ignores it. Groq's own answer is inline "[fast paced]"
+# tags, but the docs admit the model applies unrecognised directions
+# inconsistently, and a tag that sometimes works is not much use on every
+# reply. Stretching the samples ourselves is deterministic and costs ~1ms per
+# chunk.
 #
-# 1.25 reads close to natural for short confirmations. Past ~1.6 the WSOLA
-# seams start to get audible on sibilants.
+# 1.25 -> 1.15. This is the single biggest lever on the remaining chop, and
+# it is worth understanding why rather than just taking the number.
 #
-# Note this is also what forces the player to buffer: playing at 1.25x drains
-# audio faster than Groq generates it, so audio_out has to hold enough up
-# front to cover the difference. Lowering it makes speech smoother for free.
-SPEECH_SPEED = 1.25
+# Groq generates roughly at realtime. Playing at 1.25x drains the buffer at
+# 1.25 played-seconds per wall second against ~1.0 arriving, so the player
+# loses 0.25s of cushion for every second it plays -- a *structural* deficit
+# that no amount of buffering removes, only delays. Over a 4-second reply that
+# is a full second of audio that has to be pre-funded up front or made up
+# somewhere. At 1.15 the deficit is 0.15s/s, 40% smaller, and it lands inside
+# what the player's speed governor can absorb without a pause.
+#
+# As of this round audio_out treats this as a *target*, not a promise: when
+# the buffer runs thin it eases the stretch down toward 1.0 and back up again,
+# which is heard as a slight change of pace instead of a gap. So the cost of
+# this number being slightly optimistic is now "one sentence reads a little
+# slower", not "the sentence has a hole in it".
+#
+# Past ~1.6 the WSOLA seams get audible on sibilants. Below ~1.05 there is no
+# point stretching at all -- set it to 1.0 and the stretcher is skipped
+# entirely, which is the cheapest and smoothest option if you don't mind the
+# natural pace.
+SPEECH_SPEED = 1.15
 
-# Rough speaking rate, used only to tell the player how much audio is coming
-# so it can size its prebuffer. Being in the right neighbourhood is enough --
-# audio_out clamps the result, and has a reactive fallback if it's wrong.
-CHARS_PER_SECOND = 14.5
+# Rough speaking rate of the *source* audio, used only to tell the player how
+# much is coming so it can size its prebuffer and cap its recovery pauses.
+#
+# 14.5 -> 13.0. Erring low is the safe direction: it overstates how much audio
+# is still to come, which makes the prebuffer slightly generous and recovery
+# pauses slightly shorter. Erring high understates the reply and under-buffers
+# it, which is audible. audio_out clamps the result either way.
+CHARS_PER_SECOND = 13.0
 
 # Orpheus accepts 8000/16000/22050/24000/32000/44100/48000 and defaults to
 # 48000. Pinning it means audio_out never has to reopen the device mid-run,
@@ -66,7 +86,13 @@ SAMPLE_RATE = 24000
 MAX_INPUT_CHARS = 200
 
 # Network read size. Small enough that the first block lands quickly.
-CHUNK_BYTES = 4096
+#
+# 4096 -> 2048. At 24kHz mono int16 a 4096-byte read is ~85ms of audio, so the
+# player's queue only ever moved in 85ms steps and its depth sawtoothed by
+# that much between reads -- enough on its own to dip a thin buffer under the
+# low-water mark. Halving it halves the sawtooth and gets the first sample out
+# sooner, at the cost of twice as many (already trivial) socket reads.
+CHUNK_BYTES = 2048
 
 # Params the API takes but older SDK builds may not expose.
 _OPTIONAL_KEYS = ("sample_rate",)
@@ -298,8 +324,8 @@ def speak(text, on_first_audio=None):
                     speed=SPEECH_SPEED,
                     on_first_audio=on_first_audio,
                     # Lets the player work out how much to hold back before it
-                    # starts, instead of guessing a fixed figure and running
-                    # dry halfway through the sentence.
+                    # starts, and how long a mid-reply refill is allowed to
+                    # take, instead of guessing fixed figures.
                     expected_seconds=len(text) / CHARS_PER_SECOND,
                 )
                 player.start()

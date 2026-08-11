@@ -2,12 +2,11 @@
 
 Goes in: commands/parser.py  (replaces existing)
 
-Only the system prompt changed from the previous version: the fixed list of
-four valid app names is gone. The model now passes the spoken app name through
-verbatim and commands/app_index.py resolves it against what's really installed.
-That keeps the prompt the same size no matter how much software is on the
-machine, and the local resolver handles nicknames and mishearings better than
-the model can guess at them.
+Only the system prompt changed from the previous version: the window actions
+were added. The fixed list of app names is still gone -- the model passes the
+spoken app name through verbatim and commands/app_index.py resolves it against
+what's really installed, which keeps the prompt the same size no matter how
+much software is on the machine.
 """
 
 import json
@@ -45,6 +44,12 @@ If there is nothing actionable, say you didn't catch anything to do.
 - {"action": "set_volume", "value": <0-100 integer>}
 - {"action": "take_screenshot"}
 - {"action": "refresh_apps"}
+- {"action": "focus_window", "target": "<app name>"}
+- {"action": "minimize_window", "target": "<app name, or "all">"}
+- {"action": "maximize_window", "target": "<app name>"}
+- {"action": "restore_window", "target": "<app name, "all", or omit>"}
+- {"action": "arrange_windows", "layout": "<layout>", "targets": ["<app>", ...]}
+- {"action": "list_windows"}
 - {"action": "unknown", "raw": "<original phrase that wasn't understood>"}
 
 Any app installed on this machine can be opened or closed -- there is no fixed
@@ -56,6 +61,31 @@ apps resolves the name locally.
 
 Use "refresh_apps" when the user says they installed something new, or asks you
 to rescan, refresh or update your list of apps.
+
+WINDOW COMMANDS
+"open_app" launches a program; "focus_window" brings an already-running one to
+the front. Use focus_window for "switch to", "bring up", "go to", "show me",
+"put X in front". Use open_app for "open", "launch", "start", "run".
+
+"close_app" quits the program entirely. There is no action that closes a single
+window -- if the user asks to close one, use close_app and let the reply say
+you're closing the app.
+
+"minimize_window" with target "all" is the right action for "minimize
+everything", "hide everything", "clear my screen" and "show desktop".
+"restore_window" with no target puts back whatever was last minimized -- use it
+for a bare "restore", "bring them back", "undo that".
+
+For "arrange_windows", "layout" must be exactly one of: "left", "right", "top",
+"bottom", "center", "side_by_side", "grid", "cascade".
+- "snap X to the left" / "put X on the right half"  -> "left" / "right"
+- "put X and Y side by side"                        -> "side_by_side"
+- "tile my windows" / "arrange everything"          -> "grid"
+- "stack them" / "cascade my windows"               -> "cascade"
+"targets" is the list of app names in the order they should be placed, left to
+right or top to bottom. Omit "targets" entirely to arrange every open window.
+
+Use "list_windows" for "what's open", "what am I running", "list my windows".
 
 A single sentence may contain multiple actions -- extract all of them in order.
 If nothing actionable is said, "actions" should be an empty list.

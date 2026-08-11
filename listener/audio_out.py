@@ -4,25 +4,47 @@ Goes in: listener/audio_out.py   (replaces existing)
 
 One OutputStream stays open for the life of the process instead of being
 opened and torn down per reply (~50-200ms of WASAPI setup each time on
-Windows). Chunks are fed in as they arrive off the network, with a prebuffer
-sized to the connection rather than a fixed guess.
+Windows). Chunks are fed in as they arrive off the network.
 
-WHY THE PREBUFFER IS SIZED AND NOT FIXED
-----------------------------------------
-Playback runs at SPEECH_SPEED (1.25x) because Orpheus ignores the API's speed
-parameter, so the samples are stretched locally. That means the player drains
-audio 25% faster than realtime while the network delivers it at whatever rate
-Groq generates -- roughly realtime. A fixed 0.15s prebuffer against a 0.25
-seconds-per-second deficit runs dry after 0.6s of speech, every single reply,
-and you hear the sentence in pieces with words missing at the seams.
+WHAT CHANGED IN THIS ROUND, AND WHY YOU COULD STILL HEAR A GAP
+--------------------------------------------------------------
+The previous version got the direction right -- size the prebuffer to the
+connection instead of guessing -- but it had three weaknesses that together
+produce exactly the symptom "it chops sometimes":
 
-The shortfall over a whole reply is P >= T * (1 - r), where T is how long the
-reply takes to play and r is the delivery rate in played-seconds per wall
-second. Both are measurable: T from the character count the caller passes in,
-r from watching the first few chunks land. On a connection that outruns
-playback (r >= 1) this collapses to PREBUFFER_MIN_SECONDS and costs nothing.
-When the estimate is wrong anyway, _take() catches the dry queue, holds a
-longer buffer, and remembers it for the rest of the session.
+1. The delivery rate was measured once, over the first 0.35s, and never
+   revised. That window is the least representative one in the whole reply:
+   the server has usually buffered a head start and TCP hasn't settled, so
+   the first burst *overstates* the sustained rate. If the estimate came out
+   at >= 1.0 the player held only the floor, and then the real rate showed up
+   halfway through the sentence.
+
+2. When the estimate was wrong, recovery was a flat REBUFFER_FLOOR_SECONDS
+   stop -- 0.6s of dead air mid-sentence. The old comment called it "one
+   clean pause beats a dozen stutters". A 600ms hole in a 4-second sentence
+   is not clean; it is the chop you are hearing.
+
+3. It could only ever pay for the deficit with *latency* up front. Playing at
+   1.25x while audio arrives at ~1x means the queue drains 0.25 played-seconds
+   per wall second no matter how big the head start is -- a head start only
+   buys time, it never stops the bleeding.
+
+The fix for all three is the same idea: **the playback rate is a control
+knob, not a constant.** WSOLA already resamples time without touching pitch,
+and its hop size can be changed between windows with no seam. So when the
+queue gets thin, the player eases the stretch factor down toward 1.0 -- which
+*reduces the drain rate*, refills the buffer from the same incoming bytes, and
+is heard as a slight change of pace rather than as a hole. When the queue is
+healthy again it eases back up to the speed you asked for.
+
+That turns the sustained deficit into a closed loop, so the prebuffer only has
+to cover jitter rather than the whole reply. PREBUFFER_MAX_SECONDS came down
+from 2.50 to 1.20 and DEFICIT_SHARE pre-funds only part of the shortfall,
+which also means the first word arrives noticeably sooner than it used to.
+
+The reactive stop is still here as a last resort, but it is now capped by how
+much audio is actually still coming -- pausing 600ms to refill when only 200ms
+of speech remains was never sensible.
 """
 
 import collections
@@ -41,37 +63,41 @@ CHANNELS = 1
 BLOCKSIZE = 1024
 
 # Device buffer to ask PortAudio for. A cushion at the hardware level covers
-# what Python can't be relied on for: a GC pause, the GIL, a slow console
-# repaint. Costs this much added time-to-first-sample, so it stays modest.
-OUTPUT_LATENCY = 0.12
+# what Python cannot be relied on for: a GC pause, the GIL, a slow console
+# repaint. Raised from 0.12 -- on an older machine the 24fps dashboard repaint
+# is a synchronous console write holding the GIL, and 120ms was not enough
+# headroom to ride one out. Costs this much added time-to-first-sample.
+OUTPUT_LATENCY = 0.18
 
-# Frames per stream.write(). Was one write per ~800-sample visual slice, which
-# is *smaller* than BLOCKSIZE -- every write was a partial block, and the
-# device couldn't be handed a full one until two writes had landed. Keep this a
-# multiple of BLOCKSIZE.
+# Frames per stream.write(). Keep this a multiple of BLOCKSIZE so the device
+# is never handed a partial block.
 #
 # Two blocks (~85ms) rather than more: the queue drops by a full write the
 # instant one is issued but only refills at the delivery rate, so a large
 # write makes the buffer sawtooth hard enough to dip under LOW_WATER_FRAMES on
-# its own and trip the growth path for no reason.
+# its own and trip the recovery path for no reason.
 WRITE_FRAMES = BLOCKSIZE * 2
 
-# Waveform level granularity. Independent of WRITE_FRAMES now: levels for the
+# Waveform level granularity. Independent of WRITE_FRAMES: levels for the
 # whole write are published up front with staggered delays, so the visual rate
-# no longer dictates how the audio is chopped up.
+# does not dictate how the audio is chopped up.
 VIS_SLICE_SECONDS = 1.0 / 30.0
 
-# Prebuffer bounds. The floor is what a fast connection pays; the ceiling is
-# the most latency we're willing to trade for smooth playback.
+# --- Prebuffer sizing ------------------------------------------------------
 #
 # The floor has to clear the opening transient with room to spare. The first
 # writes go out while PortAudio's own buffer is still empty, so it absorbs
 # OUTPUT_LATENCY worth of them instantly and returns long before that audio
 # has played -- the queue takes the full hit of those writes against almost no
 # wall time to refill in. It has to survive that dip without falling under
-# LOW_WATER_FRAMES, or the growth path fires on the first word of every reply.
-PREBUFFER_MIN_SECONDS = 0.35
-PREBUFFER_MAX_SECONDS = 2.50
+# LOW_WATER_FRAMES, or the recovery path fires on the first word of every
+# reply.
+PREBUFFER_MIN_SECONDS = 0.30
+
+# Ceiling. Much lower than it used to be: the speed governor below now handles
+# the sustained deficit, so holding a second and a half of speech back before
+# the first word buys nothing except a slower-feeling assistant.
+PREBUFFER_MAX_SECONDS = 1.20
 
 # How long to watch chunks arrive before trusting the rate estimate.
 RATE_SAMPLE_SECONDS = 0.35
@@ -80,25 +106,62 @@ RATE_SAMPLE_SECONDS = 0.35
 # under-buffering is audible while over-buffering is not.
 RATE_MARGIN = 1.15
 
-# Reactive net, for when the estimate is wrong: where growth starts, how fast
-# it grows. Remembered across replies so a session stutters at most once.
+# Slack over and above the device buffer, to absorb one bad scheduling moment.
+JITTER_MARGIN = 0.15
+
+# How much of the projected shortfall to pre-fund with latency. The rest is
+# absorbed by the speed governor as the reply plays. 1.0 would be the old
+# behaviour (pay for all of it up front); 0.0 would lean entirely on the
+# governor and start fast but audibly slow down on every long reply.
+DEFICIT_SHARE = 0.40
+
+# --- Speed governor --------------------------------------------------------
 #
-# It relaxes again on replies that play clean, or one bad moment on the
-# network would cost every later reply the full ceiling in added latency.
-# Growth is fast and decay is slow on purpose -- the cost of being slightly
-# over is latency you can measure, the cost of being under is speech you can
-# hear breaking up.
-REBUFFER_FLOOR_SECONDS = 0.60
+# The stretch factor tts asks for is a *target*, not a promise. When the queue
+# runs thin the player eases toward MIN_SPEED, which cuts the drain rate and
+# lets the same incoming bytes refill the buffer.
+#
+# MIN_SPEED sits a hair under 1.0 on purpose. If Groq is generating slightly
+# slower than realtime, a floor of exactly 1.0 can only break even and never
+# recover; 0.95 lets the buffer actually gain. A 5% rate change with no pitch
+# shift is not something you can hear in isolation, and it is reached
+# gradually.
+MIN_SPEED = 0.95
+
+# Queue depth, in played seconds, at which to start easing down / easing back
+# up. The gap between them is a dead band -- without it the governor hunts
+# around a single threshold and the pace wobbles audibly.
+SPEED_EASE_LOW = 0.22
+SPEED_EASE_HIGH = 0.55
+
+# Fraction of the remaining distance to close per feed() call. Feeds land
+# every ~40-80ms, so this reaches the goal in roughly a fifth of a second --
+# fast enough to matter, slow enough to read as prosody.
+SPEED_EASE_RATE = 0.18
+
+# --- Reactive net ----------------------------------------------------------
+#
+# For when the estimate is wrong anyway. Remembered across replies so a
+# session stutters at most once, and relaxed again on replies that play clean
+# so one bad moment on the network does not tax every later reply.
+#
+# The floor is much lower than it was (0.60 -> 0.35) because it no longer has
+# to carry the deficit on its own.
+REBUFFER_FLOOR_SECONDS = 0.35
 REBUFFER_GROWTH = 2.0
 REBUFFER_DECAY = 0.9
 
+# Hard floor on a mid-reply refill pause, and the cap that keeps it honest:
+# never wait longer than there is audio still to come.
+REBUFFER_MIN_PAUSE = 0.12
+
 # A reply has to be at least this long before playing cleanly counts as
 # evidence the buffer is oversized. A one-second confirmation proves nothing
-# about a two-second buffer.
+# about a one-second buffer.
 CLEAN_EVIDENCE_SECONDS = 1.5
 
 # Below this the queue counts as dry. Zero is too late and too narrow -- a
-# queue hovering at 200 samples never hits zero but still can't fill a block.
+# queue hovering at 200 samples never hits zero but still cannot fill a block.
 LOW_WATER_FRAMES = BLOCKSIZE
 
 # How long a dry queue has to stay dry before it counts. Without this, the
@@ -196,7 +259,8 @@ class TimeStretcher:
     pitch stays put.
 
     Works chunk-by-chunk so it can sit in the streaming path: samples are
-    stretched as they arrive rather than after the clip is complete.
+    stretched as they arrive rather than after the clip is complete. The
+    stretch factor can be changed while it runs -- see set_speed.
     """
 
     def __init__(self, speed, samplerate, frame=None, tolerance=None):
@@ -216,6 +280,26 @@ class TimeStretcher:
         self._template = None # what should naturally follow the last window
         self._last = None     # absolute index the last window actually started at
         self._olap = np.zeros(self.hop_s, dtype=np.float32)
+
+    def set_speed(self, speed):
+        """Changes the stretch factor mid-stream.
+
+        Only `hop_a` -- how far the *input* read head advances per output
+        window -- depends on the speed. The window length, the overlap, the
+        hanning envelope and the half-window currently held in `_olap` are all
+        untouched, so the next window cross-fades into the last one exactly as
+        it would have anyway. There is no seam and no discontinuity; the
+        listener hears the pace change, nothing else.
+
+        Only ever called with a value at or below the constructor's, which
+        keeps the `keep` bound in feed() on the safe side of its one crossing
+        condition (hop_a > hop_s + tolerance, i.e. speed above ~1.5).
+        """
+        speed = max(0.5, min(2.0, float(speed)))
+        if abs(speed - self.speed) < 0.005:
+            return
+        self.speed = speed
+        self.hop_a = max(1, int(round(self.hop_s * speed)))
 
     def _best_start(self, nominal):
         """Searches near `nominal` for the window that continues the previous
@@ -267,9 +351,7 @@ class TimeStretcher:
 
             # Discard what the search window can no longer reach -- but never
             # past the point flush() will need to resume from, or the tail
-            # would replay audio that has already gone out. The two bounds
-            # only cross above speed 1.5 (hop_a > hop_s + tolerance), which is
-            # inside the range the docstring invites you to try.
+            # would replay audio that has already gone out.
             keep = min(
                 (self._nominal - self.tolerance) - self._base,
                 (self._last + self.hop_s) - self._base,
@@ -287,19 +369,19 @@ class TimeStretcher:
 
         The loop needs tolerance + frame + hop_s of lookahead before it will
         place a window, so when the stream ends there is always up to ~75ms
-        of input left over that it never got to. This used to return only
-        _olap -- the fading half of the last window, ~21ms -- and drop the
-        rest on the floor, which clipped the final consonant off every reply.
-        A clip shorter than one window fared worse still: feed() never
-        produced anything, so the whole thing came out as silence.
+        of input left over that it never got to. Returning only _olap -- the
+        fading half of the last window, ~21ms -- drops the rest on the floor
+        and clips the final consonant off every reply. A clip shorter than one
+        window fares worse still: feed() never produces anything, so the whole
+        thing comes out as silence.
 
         The remainder is emitted raw rather than windowed. It starts exactly
-        where the last window's first half ended, so it's a continuous
+        where the last window's first half ended, so it is a continuous
         signal -- no seam, no click -- and it replaces _olap rather than
         following it, since _olap is that same audio already fading out with
-        nothing left to cross-fade into. The last ~75ms plays at 1x instead
-        of 1.25x, which is not something you can hear at the end of a
-        sentence; a missing consonant is.
+        nothing left to cross-fade into. The last ~75ms plays at 1x, which is
+        not something you can hear at the end of a sentence; a missing
+        consonant is.
         """
         if self._last is None:
             rest = self._buf              # never placed a window at all
@@ -308,8 +390,7 @@ class TimeStretcher:
 
         # Full reset, not just the buffer: _base and _nominal are absolute
         # indices into a stream that has now ended, and leaving them set would
-        # put anything fed afterwards at the wrong offset. Nothing reuses a
-        # stretcher today -- one per reply -- but it shouldn't be a trap.
+        # put anything fed afterwards at the wrong offset.
         self._olap = np.zeros(self.hop_s, dtype=np.float32)
         self._buf = np.zeros(0, dtype=np.float32)
         self._template = None
@@ -325,16 +406,19 @@ class TimeStretcher:
 class StreamingPlayer:
     """Accepts raw PCM bytes as they arrive and plays them in order.
 
-        player = StreamingPlayer(samplerate=24000, speed=1.25,
-                                 expected_seconds=len(text) / 14.5)
+        player = StreamingPlayer(samplerate=24000, speed=1.15,
+                                 expected_seconds=len(text) / 13.0)
         player.start()
         for chunk in network_stream:
             player.feed(chunk)
         player.finish()   # blocks until queued audio has played out
 
     `expected_seconds` is a rough guess at how much *source* audio is coming,
-    used only to size the prebuffer. Wrong is fine; absent is fine too, it
-    just falls back to the reactive path.
+    used only to size the prebuffer and to cap recovery pauses. Wrong is fine;
+    absent is fine too, it just falls back to the reactive path.
+
+    `speed` is a target. The player will ease below it -- never above -- when
+    the buffer cannot sustain it. See the speed governor notes at the top.
     """
 
     def __init__(self, samplerate=DEFAULT_SAMPLE_RATE, speed=1.0,
@@ -348,18 +432,23 @@ class StreamingPlayer:
         self._on_first_audio = on_first_audio
 
         # One condition guards the whole handoff: the chunk deque, how many
-        # samples are in it, and the two flags that end the wait. A plain
-        # Queue can't answer "how many seconds are buffered", which is the
-        # question this class now exists to ask.
+        # samples are in it, and the flags that end the wait. A plain Queue
+        # cannot answer "how many seconds are buffered", which is the question
+        # this class exists to ask.
         self._cv = threading.Condition()
         self._chunks = collections.deque()
         self._queued = 0
         self._done = False
         self._aborted = False
+        self._playing = False
 
         # Delivery rate bookkeeping, read under _cv.
         self._t0 = None
         self._produced = 0
+
+        # Speed governor state. Only the producer thread writes these.
+        self._speed_now = self.speed
+        self._speed_floor_seen = self.speed
 
         self._leftover = b""
         self._thread = None
@@ -388,9 +477,58 @@ class StreamingPlayer:
         samples = np.frombuffer(buf[:aligned], dtype=np.int16)
 
         if self._stretcher is not None:
+            # Adjust before stretching, so this chunk is already produced at
+            # whatever rate the buffer can currently afford.
+            self._adapt_speed()
             samples = self._stretcher.feed(samples)
 
         self._enqueue(samples)
+
+    def _adapt_speed(self):
+        """Eases the stretch factor toward whatever the buffer can sustain.
+
+        Runs on the network thread, which is the only thread that stretches,
+        so no lock is needed on the governor's own state. The queue depth is
+        read under _cv and released immediately -- nothing slow happens while
+        it is held.
+
+        Deliberately inert until playback has actually started: while the
+        prebuffer is filling the queue is legitimately small and nothing is
+        draining it, so reacting to that depth would slow every reply down
+        before its first word for no reason.
+        """
+        with self._cv:
+            queued = self._queued
+            playing = self._playing
+            aborted = self._aborted
+
+        if aborted or not playing:
+            return
+
+        seconds = queued / float(self.samplerate)
+
+        if seconds < SPEED_EASE_LOW:
+            goal = MIN_SPEED
+        elif seconds > SPEED_EASE_HIGH:
+            goal = self.speed
+        else:
+            return  # dead band -- leave it alone rather than hunt
+
+        current = self._speed_now
+        updated = current + (goal - current) * SPEED_EASE_RATE
+
+        # Snap the last sliver rather than approach it asymptotically forever.
+        if abs(goal - updated) < 0.01:
+            updated = goal
+
+        updated = max(MIN_SPEED, min(self.speed, updated))
+        if abs(updated - current) < 0.005:
+            return
+
+        self._speed_now = updated
+        if updated < self._speed_floor_seen:
+            self._speed_floor_seen = updated
+        self._stretcher.set_speed(updated)
 
     def _enqueue(self, samples):
         if len(samples) == 0:
@@ -426,10 +564,30 @@ class StreamingPlayer:
 
     # --- consumer side -----------------------------------------------------
 
+    def _remaining_output_seconds(self):
+        """How much audio is still expected to arrive, in played seconds.
+
+        None when there is no estimate to work from. Approximate by
+        construction -- if the governor has eased the speed down, the real
+        total runs a little longer than this and the figure reads low. That
+        bias is the safe one: it only ever shortens a recovery pause.
+        """
+        if not self.expected_seconds:
+            return None
+        with self._cv:
+            produced = self._produced
+        total = self.expected_seconds / self.speed
+        return max(0.0, total - produced / float(self.samplerate))
+
     def _required_prebuffer(self, floor):
         """Seconds to hold before starting, from the measured delivery rate.
 
-        Returns `floor` until there's enough evidence to do better.
+        Returns `floor` until there is enough evidence to do better.
+
+        Only part of the projected shortfall is funded here (DEFICIT_SHARE);
+        the speed governor absorbs the rest as the reply plays. Paying for all
+        of it up front is what used to put a second or more of silence in
+        front of every long reply.
         """
         if not self.expected_seconds:
             return floor
@@ -444,30 +602,30 @@ class StreamingPlayer:
             return floor
 
         # Played-seconds delivered per wall second. Above 1 and the network is
-        # outrunning playback, so there's nothing to hold back for.
+        # outrunning playback, so there is nothing to hold back for beyond the
+        # device buffer and a jitter margin.
         rate = (produced / float(self.samplerate)) / elapsed
         rate /= RATE_MARGIN
-        if rate >= 1.0:
-            return floor
 
-        playtime = self.expected_seconds / self.speed
+        need = OUTPUT_LATENCY + JITTER_MARGIN
+        if rate < 1.0:
+            playtime = self.expected_seconds / self.speed
+            need += playtime * (1.0 - rate) * DEFICIT_SHARE
 
-        # The shortfall over the reply, plus the device buffer: PortAudio
-        # takes OUTPUT_LATENCY out of the queue in the first few writes,
-        # before any of it has played.
-        need = playtime * (1.0 - rate) + OUTPUT_LATENCY
         return max(floor, min(PREBUFFER_MAX_SECONDS, need))
 
     def _await_start(self):
-        """Holds the first sample back until there's enough buffered to get
-        through the reply without running dry.
+        """Holds the first sample back until there is enough buffered to get
+        through the opening of the reply without running dry.
 
         Polled rather than event-driven on purpose: the target moves as the
         rate estimate firms up, and a 10ms poll for the fraction of a second
-        this runs is not worth the extra condition-variable bookkeeping.
+        this runs is not worth the extra condition-variable bookkeeping. The
+        polling is also what makes the estimate self-correcting -- a slowdown
+        during the wait drags the cumulative rate down and raises the target
+        before the first word is ever played.
         """
         floor = max(PREBUFFER_MIN_SECONDS, learned_prebuffer())
-        target = floor
 
         while True:
             with self._cv:
@@ -488,20 +646,24 @@ class StreamingPlayer:
     def _take(self, want):
         """Pops up to `want` samples. None means end of stream.
 
-        Running dry mid-reply is the bug this class was rewritten for, so it
-        isn't treated as an ordinary wait. We stop writing, raise the
-        prebuffer for the rest of the session, and refill to the new figure
-        before carrying on. One clean pause beats a dozen stutters, and the
-        next reply starts with a buffer that already knows better.
+        Running dry mid-reply should now be rare -- the governor gives ground
+        on pace long before the queue empties -- but if the network stops
+        outright there is nothing pace can do about it. In that case we stop
+        writing, raise the prebuffer for the rest of the session, and refill
+        before carrying on.
+
+        The refill is capped by how much audio is actually still coming.
+        Waiting 350ms to top up when 150ms of speech remains is how a recovery
+        ends up longer than the gap it was recovering from.
         """
         warn = None
 
         with self._cv:
             if self._dry_locked():
-                # Give it a grace period first. The normal end of a healthy
-                # reply looks identical from here -- last chunk delivered,
-                # finish() a millisecond behind it -- and counting that as an
-                # underrun would raise the prebuffer on every single reply.
+                # Grace period first. The normal end of a healthy reply looks
+                # identical from here -- last chunk delivered, finish() a
+                # millisecond behind it -- and counting that as an underrun
+                # would raise the prebuffer on every single reply.
                 deadline = time.monotonic() + DRY_GRACE_SECONDS
                 while self._dry_locked():
                     left = deadline - time.monotonic()
@@ -511,9 +673,14 @@ class StreamingPlayer:
 
             if self._dry_locked():
                 refill = _grow_learned()
+                left = self._remaining_output_seconds()
+                if left is not None:
+                    refill = min(refill, max(REBUFFER_MIN_PAUSE, left))
+
                 if not self._warned_dry:
                     self._warned_dry = True
                     warn = refill
+
                 need = int(self.samplerate * refill)
                 while (self._queued < need
                         and not self._done and not self._aborted):
@@ -546,7 +713,7 @@ class StreamingPlayer:
         # network thread's next feed() at the exact moment the buffer is
         # already starving, which is the stall this class exists to avoid.
         if warn is not None:
-            print("speech: buffer ran dry, now holding {:.2f}s".format(warn))
+            print("speech: buffer ran dry, holding {:.2f}s".format(warn))
 
         return block
 
@@ -556,7 +723,7 @@ class StreamingPlayer:
         Published before the write, not after: stream.write() blocks until the
         device has room, so a level pushed afterwards is already late. `lag`
         covers what the device is still holding; the stagger covers position
-        within the block, since the tail of a 170ms write is heard 170ms after
+        within the block, since the tail of an 85ms write is heard 85ms after
         its head.
         """
         step = max(1, int(self.samplerate * VIS_SLICE_SECONDS))
@@ -596,6 +763,11 @@ class StreamingPlayer:
 
         self._await_start()
 
+        # Arm the governor only now. Everything before this point had nothing
+        # draining the queue, so a thin queue meant nothing.
+        with self._cv:
+            self._playing = True
+
         first = True
         written = 0
         while not self._aborted:
@@ -621,16 +793,23 @@ class StreamingPlayer:
 
         # PortAudio is still holding the last blocks. finish() claiming
         # "played out" while the closing word is unheard is how a deferred
-        # set_volume ends up jumping the end of the sentence -- and how
-        # the timing line reports a reply as spoken before it is.
+        # set_volume ends up jumping the end of the sentence -- and how the
+        # timing line reports a reply as spoken before it is.
         time.sleep(min(lag, 0.5))
+
+        # Report *after* playback, never during: this print goes through the
+        # dashboard proxy and repaints the panel, and the audio path must not
+        # queue behind a console write.
+        if self._speed_floor_seen < self.speed - 0.02:
+            print("speech: eased to {:.2f}x to keep up (target {:.2f}x)".format(
+                self._speed_floor_seen, self.speed
+            ))
 
         # A reply of real length that never ran dry is evidence the buffer is
         # bigger than it needs to be, so give some of it back. Without this,
         # one bad thirty seconds on the network would cost every reply for the
-        # rest of the session up to 2.5s of added silence before the first
-        # word -- and past the point where the whole reply fits inside the
-        # buffer, streaming has quietly stopped happening at all.
+        # rest of the session -- and past the point where the whole reply fits
+        # inside the buffer, streaming has quietly stopped happening at all.
         played = written / float(self.samplerate)
         if not self._warned_dry and played >= CLEAN_EVIDENCE_SECONDS:
             _relax_learned()

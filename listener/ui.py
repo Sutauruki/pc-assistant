@@ -1,9 +1,10 @@
-"""Live terminal dashboard with an audio-synced waveform.
+"""Live terminal dashboard with an audio-synced waveform and a typed prompt.
 
-Goes in: listener/ui.py   (new file)
+Goes in: listener/ui.py   (replaces existing)
 
 Draws a fixed panel at the bottom of the terminal -- state, waveform, what was
-heard, what Jarvis said -- while ordinary log output keeps scrolling above it.
+heard, what Jarvis said, and a prompt line you can type into -- while ordinary
+log output keeps scrolling above it.
 
 The waveform is driven from two places:
 
@@ -23,6 +24,17 @@ The corollary, learned the hard way: push_level() runs on the thread feeding
 the sound card, so it cannot be allowed to block. It takes its own small lock
 rather than the render lock, which is held across the console write. See the
 note in Dashboard.__init__.
+
+NEW: THE PROMPT ROW
+-------------------
+set_input() draws the line you are currently typing *inside* the panel, and
+listener/console_input.py reads keystrokes without the console echoing them.
+Letting the terminal echo normally does not work here: the cursor parks on the
+row below the panel, so a pressed Enter scrolls the screen by one line while
+the panel's own `\x1b[{n}A` arithmetic still thinks it is n rows up. The panel
+then walks down the screen one row per submitted line, leaving a trail of dead
+borders. Owning the echo removes the whole class of problem -- nothing but
+this module ever moves the cursor.
 
 No new dependencies: ANSI escapes and a render thread. If stdout isn't a
 terminal (piped to a file, running under a dumb console) the whole thing
@@ -73,6 +85,10 @@ THINK_AMPLITUDE = 0.22
 # shouldn't be able to park levels a minute into the future.
 MAX_DELAY_FRAMES = FPS  # one second
 
+# Caret blink period, in frames per phase. Only blinks while there is text in
+# the buffer -- see the note in _input_row.
+CARET_FRAMES = FPS // 2
+
 # RMS -> 0..1 mapping, in dBFS. Speech sits around -30dB, so a linear
 # amplitude scale would keep the bars in the bottom fifth of the panel;
 # the log mapping is what makes normal speech fill the height.
@@ -93,11 +109,13 @@ _BOX_UNICODE = {
     "tl": "╭", "tr": "╮", "bl": "╰", "br": "╯",
     "h": "─", "v": "│", "ml": "├", "mr": "┤",
     "dot": "●", "prompt": "❯", "reply": "◆", "sep": "·",
+    "typed": "›", "caret": "▌",
 }
 _BOX_ASCII = {
     "tl": "+", "tr": "+", "bl": "+", "br": "+",
     "h": "-", "v": "|", "ml": "+", "mr": "+",
     "dot": "*", "prompt": ">", "reply": "*", "sep": "-",
+    "typed": ">", "caret": "_",
 }
 
 
@@ -231,6 +249,12 @@ class Dashboard(object):
         self._reply = ""
         self._timing = ""
 
+        # Prompt row. Off until console_input says it has a reader running --
+        # showing a prompt you cannot type into would be a lie.
+        self._input = ""
+        self._input_enabled = False
+        self._input_hint = "type a command"
+
         self._lines_drawn = 0
         self._last_frame = None
 
@@ -274,6 +298,7 @@ class Dashboard(object):
 
             if not _can_encode(
                 _BOX_UNICODE["tl"] + _BLOCKS[-1] + _SPINNER[0] + "…"
+                + _BOX_UNICODE["typed"] + _BOX_UNICODE["caret"]
             ):
                 self._box = _BOX_ASCII
                 self._blocks = _BLOCKS_ASCII
@@ -417,6 +442,22 @@ class Dashboard(object):
         with self._lock:
             self._timing = (text or "").strip()
 
+    def enable_input(self, enabled=True, hint=None):
+        """Shows or hides the prompt row. console_input calls this once it
+        knows it actually has a keystroke reader."""
+        with self._lock:
+            self._input_enabled = bool(enabled)
+            if hint is not None:
+                self._input_hint = hint
+            if not enabled:
+                self._input = ""
+
+    def set_input(self, text):
+        """The line currently being typed. Called from the reader thread on
+        every keystroke -- cheap, and it never prints."""
+        with self._lock:
+            self._input = text or ""
+
     def log(self, line):
         """Prints above the panel."""
         with self._lock:
@@ -498,11 +539,15 @@ class Dashboard(object):
         """Columns of history to keep. Matches what _frame_locked draws."""
         return max(8, self._panel_width() - 6)
 
-    def _panel_width(self):
+    def _terminal_size(self):
         try:
-            columns = shutil.get_terminal_size().columns
+            size = shutil.get_terminal_size()
+            return size.columns, size.lines
         except Exception:
-            columns = 80
+            return 80, 24
+
+    def _panel_width(self):
+        columns = self._terminal_size()[0]
         # Never wider than the terminal: a row that wraps adds a line the
         # cursor-up arithmetic doesn't know about, and the panel walks down
         # the screen one row per frame.
@@ -611,9 +656,20 @@ class Dashboard(object):
             " ", self._timing, inner, DIM_RGB, DIM_RGB
         ))
 
+        # --- prompt
+        if self._input_enabled:
+            rows.append(self._input_row(inner, accent))
+
         rows.append(
             border + box["bl"] + box["h"] * (inner + 2) + box["br"] + reset
         )
+
+        # A panel taller than the terminal cannot be drawn with relative
+        # cursor moves -- the top rows scroll off, the cursor-up count
+        # overshoots into scrollback, and the panel shreds itself. Two rows
+        # spare so log output still has somewhere to land.
+        if len(rows) + 2 > self._terminal_size()[1]:
+            return None
 
         return "\n".join(rows)
 
@@ -678,12 +734,51 @@ class Dashboard(object):
         )
         return self._pad_row(painted, len(plain), inner, _fg(BORDER_RGB))
 
+    def _input_row(self, inner, accent):
+        """The line being typed, truncated from the *left*.
+
+        Opposite of _text_row, and deliberately: on a transcript you want the
+        beginning, on a line you are still typing you want the end -- the
+        cursor has to stay on screen or you're typing blind.
+
+        The caret only blinks while there is text. A caret that blinks forever
+        changes the frame twice a second, and _draw_locked skips the console
+        write when the frame is unchanged -- so an always-blinking caret would
+        quietly turn an idle panel from zero repaints per second into two, on
+        a machine this project is trying to be gentle to.
+        """
+        box = self._box
+        text = self._input
+
+        if not text:
+            return self._text_row(
+                box["typed"], self._input_hint, inner, DIM_RGB, DIM_RGB
+            )
+
+        caret = box["caret"] if (self._tick // CARET_FRAMES) % 2 == 0 else " "
+
+        # glyph + space + caret
+        room = max(1, inner - 2 - len(caret))
+        shown = text
+        if len(shown) > room:
+            keep = max(0, room - len(self._ellipsis))
+            shown = self._ellipsis + shown[len(shown) - keep:]
+
+        plain = "{} {}{}".format(box["typed"], shown, caret)
+        painted = (
+            _fg(accent) + box["typed"] + "\x1b[0m "
+            + _fg(TEXT_RGB) + shown + "\x1b[0m"
+            + _fg(accent) + caret + "\x1b[0m"
+        )
+        return self._pad_row(painted, len(plain), inner, _fg(BORDER_RGB))
+
 
 # --- Module-level façade ---------------------------------------------------
 #
-# record.py and audio_out.py call straight into these. Keeping them as plain
-# functions means those modules don't have to know whether a dashboard is
-# running -- when it isn't, every call is a cheap no-op.
+# record.py, audio_out.py and console_input.py call straight into these.
+# Keeping them as plain functions means those modules don't have to know
+# whether a dashboard is running -- when it isn't, every call is a cheap
+# no-op.
 
 _dashboard = Dashboard()
 
@@ -720,6 +815,14 @@ def set_timing(text):
     _dashboard.set_timing(text)
 
 
+def enable_input(enabled=True, hint=None):
+    _dashboard.enable_input(enabled, hint=hint)
+
+
+def set_input(text):
+    _dashboard.set_input(text)
+
+
 def log(line):
     _dashboard.log(line)
 
@@ -739,10 +842,19 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     try:
+        enable_input(True)
         set_state(LISTENING)
         for _ in range(int(FPS * 1.5)):
             push_level(random.uniform(0.0, 0.06))
             time.sleep(1.0 / FPS)
+
+        # Prompt row: text appearing a character at a time, caret blinking.
+        typed = "arrange chrome on the left"
+        for i in range(len(typed) + 1):
+            set_input(typed[:i])
+            time.sleep(0.05)
+        time.sleep(0.6)
+        set_input("")
 
         set_state(RECORDING)
         set_heard("open spotify and take a screenshot")
