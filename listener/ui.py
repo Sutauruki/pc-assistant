@@ -53,6 +53,7 @@ import shutil
 import sys
 import threading
 import time
+from collections import deque
 
 # --- States ----------------------------------------------------------------
 
@@ -116,6 +117,15 @@ BORDER_RGB = (70, 78, 92)
 TEXT_RGB = (176, 184, 198)
 DIM_RGB = (108, 116, 132)
 
+# Info column values, ported from the mockup's "5dcaa5" accent -- the same
+# green the STT/TTS/latency/sparkline/turns rows use in the HTML.
+STATS_RGB = (93, 202, 165)
+
+# Number of recent audio levels (in frames) the info column's sparkline
+# shows at the ring's right. Same idea as the mockup's fixed "▁▂▁▃▂" row but
+# live -- it scrolls with whatever the mic/speaker actually produced.
+SPARK_WIDTH = 24
+
 _SPINNER = "◐◓◑◒"
 _SPINNER_ASCII = "|/-\\"
 
@@ -125,6 +135,12 @@ _SPINNER_ASCII = "|/-\\"
 # makes the ring round instead of egg-shaped.
 _RING_UNICODE = {"top": "▀", "bottom": "▄", "full": "█"}
 _RING_ASCII = {"top": "\"", "bottom": ",", "full": "#"}
+
+# Sparkline glyphs for the info column, with an ASCII fallback for consoles
+# that can't render the unicode half-blocks (paired with _RING_UNICODE via
+# the same capability check in start()).
+_SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
+_SPARK_ASCII = ".+*#@%"
 
 _BOX_UNICODE = {
     "tl": "╭", "tr": "╮", "bl": "╰", "br": "╯",
@@ -291,6 +307,14 @@ class Dashboard(object):
         self._reply = ""
         self._timing = ""
 
+        # Info column (the mockup's rows to the right of the ring).
+        self._stt = "gemini"
+        self._tts = "groq · cloud"
+        self._latency = "1.4s"
+        self._turns = 0
+        self._t0 = None
+        self._spark = deque(maxlen=SPARK_WIDTH)
+
         # Prompt row. Off until console_input says it has a reader running --
         # showing a prompt you cannot type into would be a lie.
         self._input = ""
@@ -349,6 +373,7 @@ class Dashboard(object):
 
             self._active = True
             self._stop.clear()
+            self._t0 = time.time()
             self._out = stream          # whatever's really attached, not __stdout__
             self._proxy = _StreamProxy(self, stream)
             sys.stdout = self._proxy
@@ -484,6 +509,26 @@ class Dashboard(object):
         with self._lock:
             self._timing = (text or "").strip()
 
+    def set_engine(self, stt=None, tts=None):
+        """Info column: the STT and TTS backend labels the mockup shows as
+        "gemini" and "groq · cloud"."""
+        if stt is None and tts is None:
+            return
+        with self._lock:
+            if stt is not None:
+                self._stt = stt
+            if tts is not None:
+                self._tts = tts
+
+    def set_latency(self, text):
+        with self._lock:
+            if text:
+                self._latency = (text or "").strip()
+
+    def set_turns(self, count):
+        with self._lock:
+            self._turns = int(count or 0)
+
     def enable_input(self, enabled=True, hint=None):
         """Shows or hides the prompt row. console_input calls this once it
         knows it actually has a keystroke reader."""
@@ -569,6 +614,7 @@ class Dashboard(object):
                 level = 0.0
 
         self._last_level = level
+        self._spark.append(level)
         self._spin = (self._spin + 1) % (len(self._spinner) * 4)
 
     def _ring_cols(self):
@@ -682,15 +728,15 @@ class Dashboard(object):
             + border + " " + box["h"] + box["tr"] + reset
         )
 
-        # --- ring
+        # --- ring + info column
         # Derived from `inner` rather than re-measuring the terminal, same
         # reasoning as the old wave: a resize between the two reads would
-        # put the ring and the borders on different widths for a frame.
+        # put the ring and the borders on different widths for a frame. The
+        # ring sits left, the mockup's STT/TTS/latency/sparkline/turns
+        # stats sit to its right.
         ring_cols = self._ring_cols()
-        for row in self._ring_rows(ring_cols, accent):
-            rows.append(
-                self._pad_row(row, ring_cols, inner, border, center=True)
-            )
+        for row in self._ring_info_rows(ring_cols, accent, inner):
+            rows.append(row)
 
         rows.append(
             border + box["ml"] + box["h"] * (inner + 2) + box["mr"] + reset
@@ -813,6 +859,74 @@ class Dashboard(object):
             ]
             out.append("".join(cells))
         return out
+
+    def _kv_line(self, label, value):
+        """One label/value row for the info column -- dim label, then the
+        accent-green value, mirroring the mockup's "STT  gemini" styling."""
+        painted = (
+            _fg(DIM_RGB) + label + "\x1b[0m"
+            + _fg(STATS_RGB) + value + "\x1b[0m"
+        )
+        return painted, len(label) + len(value)
+
+    def _spark_painted(self):
+        """The mockup's live sparkline, grown from the recent audio levels
+        (self._spark) into a column of ▁…█ blocks, all in the mockup green.
+        Falls back to ASCII bars on consoles that can't show the blocks
+        (same capability check that drives the ring's fallback)."""
+        blocks = _SPARK_BLOCKS if self._ring_chars is _RING_UNICODE else _SPARK_ASCII
+        vals = list(self._spark)
+        if len(vals) < SPARK_WIDTH:
+            vals = [0.0] * (SPARK_WIDTH - len(vals)) + vals
+        vals = vals[-SPARK_WIDTH:]
+        chars = "".join(blocks[min(len(blocks) - 1, int(v * (len(blocks) - 1) + 0.5))] for v in vals)
+        painted = _fg(STATS_RGB) + chars + "\x1b[0m"
+        return painted, len(chars)
+
+    def _info_lines(self, inner):
+        """The five mockup info rows, each as (painted, visible_len)."""
+        uptime = 0
+        if self._t0 is not None:
+            uptime = int(time.time() - self._t0)
+        minutes = uptime // 60
+        up_str = "{}m".format(minutes) if minutes else "{}s".format(uptime)
+
+        lines = [
+            self._kv_line("STT ", self._stt),
+            self._kv_line("TTS ", self._tts),
+            self._kv_line("latency ", self._latency),
+            self._spark_painted(),
+            self._kv_line(
+                "turns {} · up {}".format(self._turns, up_str), ""
+            ),
+        ]
+        # Don't let an info line push past the right edge of the panel.
+        room = inner - len(" ") - len("STT ")
+        for i, (painted, vlen) in enumerate(lines):
+            if vlen > room:
+                lines[i] = (painted, room)
+        return lines
+
+    def _ring_info_rows(self, ring_cols, accent, inner):
+        """The ring on the left with the info column centred vertically to
+        its right -- the mockup's flex layout, one terminal row at a time."""
+        ring_rows = self._ring_rows(ring_cols, accent)
+        info = self._info_lines(inner)
+        gap = 7
+        start = (len(ring_rows) - len(info)) // 2
+        if start < 0:
+            start = 0
+        border = _fg(BORDER_RGB)
+        rows = []
+        for i, ring_row in enumerate(ring_rows):
+            if start <= i < start + len(info):
+                painted, vlen = info[i - start]
+            else:
+                painted, vlen = "", 0
+            combined = ring_row + " " * gap + painted
+            visible = ring_cols + gap + vlen
+            rows.append(self._pad_row(combined, visible, inner, border))
+        return rows
 
     def _pad_row(self, painted, visible_len, inner, border, center=False):
         """Wraps one row of already-coloured content in the panel borders.
@@ -951,6 +1065,18 @@ def set_timing(text):
     _dashboard.set_timing(text)
 
 
+def set_engine(stt=None, tts=None):
+    _dashboard.set_engine(stt=stt, tts=tts)
+
+
+def set_latency(text):
+    _dashboard.set_latency(text)
+
+
+def set_turns(count):
+    _dashboard.set_turns(count)
+
+
 def enable_input(enabled=True, hint=None):
     _dashboard.enable_input(enabled, hint=hint)
 
@@ -980,6 +1106,9 @@ if __name__ == "__main__":
     try:
         enable_input(True)
         set_state(LISTENING)
+        set_engine("gemini", "groq · cloud")
+        set_turns(14)
+        set_latency("1.4s")
         for _ in range(int(FPS * 1.5)):
             push_level(random.uniform(0.0, 0.06))
             time.sleep(1.0 / FPS)
