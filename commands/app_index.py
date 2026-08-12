@@ -57,6 +57,15 @@ from ctypes import wintypes
 
 import psutil
 
+# The "don't kill Jarvis's own host" guard. Imported defensively so a missing
+# file degrades to the old ancestor-only behaviour instead of taking the whole
+# app index down at import time.
+try:
+    from commands import self_guard
+except Exception:  # pragma: no cover - only if the file wasn't copied over
+    self_guard = None
+    print("app index: self_guard missing -- close_app is running unprotected")
+
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
@@ -95,6 +104,13 @@ ADOPT_POLL_SECONDS = 0.4
 # their state. Set False for instant, unconditional termination.
 GRACEFUL_CLOSE = True
 GRACEFUL_TIMEOUT = 1.2
+
+# How long to wait after terminate() before escalating to kill(), and after
+# kill() before accepting that the process is beyond us. Both are polled, so
+# they cost nothing when the process dies immediately -- which is the norm.
+ESCALATE_TIMEOUT = 1.0
+KILL_TIMEOUT = 0.5
+DEATH_POLL_SECONDS = 0.05
 
 CREATE_NO_WINDOW = 0x08000000
 WM_CLOSE = 0x0010
@@ -861,7 +877,13 @@ def _install(catalog):
 
 
 def _scan_now(quiet=False):
-    """Rescans and installs the result. Returns the number of apps found."""
+    """Rescans and installs the result. Returns the number of apps found.
+
+    Never raises. This runs on a daemon thread at startup, and an escape
+    there would both dump a traceback into the terminal and leave
+    _catalog_ready unset -- so every later lookup would sit through the full
+    CATALOG_WAIT_SECONDS before falling back.
+    """
     with _scan_lock:
         started = time.perf_counter()
         try:
@@ -871,14 +893,25 @@ def _scan_now(quiet=False):
             _catalog_ready.set()  # unblock waiters; they'll get fallbacks
             return 0
 
-        catalog = _build_catalog(rows)
+        try:
+            catalog = _build_catalog(rows)
+        except Exception as e:
+            print("app index: building the catalog failed ({})".format(e))
+            _catalog_ready.set()
+            return 0
+
         if not catalog:
             print("app index: scan found nothing usable")
             _catalog_ready.set()
             return 0
 
         _install(catalog)
-        _save_cache(catalog)
+
+        try:
+            _save_cache(catalog)
+        except Exception as e:
+            # Cache is an optimisation. Losing it costs one slow startup.
+            print("app index: couldn't cache the scan ({})".format(e))
 
         if not quiet:
             print("app index: {} apps in {:.1f}s".format(
@@ -888,11 +921,23 @@ def _scan_now(quiet=False):
 
 
 def _ensure_catalog():
-    """Serve the cache immediately if we have one; rescan when it's stale."""
-    rows, scanned_at = _load_cache()
+    """Serve the cache immediately if we have one; rescan when it's stale.
+
+    Also a daemon thread target, so it swallows too -- see _scan_now.
+    """
+    try:
+        rows, scanned_at = _load_cache()
+    except Exception as e:
+        print("app index: couldn't read the cache ({})".format(e))
+        rows, scanned_at = None, 0
 
     if rows:
-        catalog = _build_catalog(rows)
+        try:
+            catalog = _build_catalog(rows)
+        except Exception as e:
+            print("app index: cached catalog unusable ({})".format(e))
+            catalog = None
+
         if catalog:
             _install(catalog)
             age_days = (time.time() - scanned_at) / 86400.0
@@ -1013,7 +1058,13 @@ def _fallback_entry(spoken):
 # ---------------------------------------------------------------------------
 
 def _snapshot_pids():
-    return set(proc.pid for proc in psutil.process_iter())
+    # Called just before launching, outside open_app's try -- so a raise here
+    # would abort the launch itself. An empty snapshot only costs precision
+    # in the adopt pass, never the launch.
+    try:
+        return set(proc.pid for proc in psutil.process_iter())
+    except Exception:
+        return set()
 
 
 def _remember(key, pids):
@@ -1033,20 +1084,29 @@ def _adopt_new_processes(key, entry, before):
     """
     expected = entry.exe_names()
     name_keys = entry.keys
-    deadline = time.time() + ADOPT_WINDOW_SECONDS
+    deadline = time.monotonic() + ADOPT_WINDOW_SECONDS
     seen = set(before)
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         time.sleep(ADOPT_POLL_SECONDS)
         adopted = set()
 
-        for proc in psutil.process_iter(["pid", "name"]):
-            pid = proc.info["pid"]
+        try:
+            processes = list(psutil.process_iter(["pid", "name"]))
+        except Exception:
+            continue
+
+        for proc in processes:
+            try:
+                pid = proc.info["pid"]
+                name = (proc.info["name"] or "").lower()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                continue
+
             if pid in seen:
                 continue
             seen.add(pid)
 
-            name = (proc.info["name"] or "").lower()
             if not name or name in _PROTECTED:
                 continue
 
@@ -1129,6 +1189,13 @@ def _start_appid(entry):
 # ---------------------------------------------------------------------------
 
 def _self_pids():
+    """This process and its ancestor chain.
+
+    Kept, but it is no longer the real protection -- see self_guard.py. An
+    ancestor set cannot contain the sibling processes of a multi-process app,
+    which is exactly what needed protecting. This now covers the narrow case
+    (our own PID, our direct parents) and self_guard covers the broad one.
+    """
     pids = set([os.getpid()])
     try:
         for parent in psutil.Process().parents():
@@ -1139,13 +1206,29 @@ def _self_pids():
 
 
 def _safe_to_kill(proc, protected_pids):
+    """False for anything that would take Jarvis down with it.
+
+    Three rails, cheapest first: the ancestor PIDs, the OS process list, then
+    self_guard's executable match. That last one is the one that matters --
+    it is what makes every Code.exe untouchable rather than just the one that
+    happens to be our parent.
+
+    This is a backstop. close_app filters through self_guard before it ever
+    calls _terminate, because a refusal it can explain out loud is better than
+    a silent skip. But _terminate also walks children recursively, and a child
+    of a legitimate target can still turn out to be one of ours, so the check
+    belongs here too.
+    """
     try:
         if proc.pid in protected_pids or proc.pid <= 4:
             return False
-        return (proc.name() or "").lower() not in _PROTECTED
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        if (proc.name() or "").lower() in _PROTECTED:
+            return False
+        if self_guard is not None and self_guard.is_protected(proc):
+            return False
+        return True
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
         return False
-
 
 def _tracked_pids(key):
     with _launched_lock:
@@ -1154,10 +1237,14 @@ def _tracked_pids(key):
     alive = set()
     for pid in pids:
         try:
-            if psutil.Process(pid).is_running():
-                alive.add(pid)
-        except psutil.NoSuchProcess:
+            proc = psutil.Process(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue
+        # _is_running, not proc.is_running() -- the bare call raises
+        # AccessDenied on an elevated PID, which used to throw away this
+        # whole set and drop us onto the fuzzier strategies below.
+        if _is_running(proc):
+            alive.add(pid)
 
     with _launched_lock:
         if key in _launched:
@@ -1247,30 +1334,81 @@ def _pids_by_window_title(spoken, entry):
 
 
 def _request_window_close(pids):
+    """Asks each window to close itself. Returns how many actually accepted.
+
+    PostMessageW's return value matters here. UIPI blocks messages sent from
+    a medium-integrity process to a high-integrity window, and it does it
+    silently -- the call just returns FALSE. Counting those as posted meant
+    burning the whole graceful timeout waiting on a WM_CLOSE that was never
+    delivered, every single time an elevated app was targeted.
+    """
     posted = 0
     pidset = set(pids)
     for hwnd, pid, _title in _iter_windows():
-        if pid in pidset:
-            _user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
-            posted += 1
+        if pid not in pidset:
+            continue
+        try:
+            if _user32.PostMessageW(hwnd, WM_CLOSE, 0, 0):
+                posted += 1
+        except OSError:
+            continue
     return posted
 
 
+def _is_running(proc):
+    """True if the process is still there.
+
+    Unknown counts as *alive*. Guessing the other way is how you end up
+    announcing "Closed Task Manager" to someone staring at Task Manager.
+    """
+    try:
+        return proc.is_running()
+    except psutil.NoSuchProcess:
+        return False
+    except (psutil.AccessDenied, OSError):
+        return True
+
+
+def _wait_gone(procs, timeout):
+    """Waits for processes to die. Returns the ones still standing.
+
+    This is psutil.wait_procs' job, but wait_procs is not survivable: its
+    inner check_gone catches TimeoutExpired and NoSuchProcess and nothing
+    else, so one process we're not allowed to open -- Task Manager, anything
+    launched as admin -- raises AccessDenied straight out of the call and
+    takes the entire close path down with it. Polling ourselves costs a few
+    milliseconds and cannot be derailed by a single PID.
+    """
+    alive = list(procs)
+    deadline = time.monotonic() + timeout
+    while True:
+        alive = [proc for proc in alive if _is_running(proc)]
+        if not alive or time.monotonic() >= deadline:
+            return alive
+        time.sleep(DEATH_POLL_SECONDS)
+
+
 def _terminate(pids):
-    """Closes gracefully first, then escalates. Returns how many died."""
+    """Closes gracefully first, then escalates.
+
+    Returns (killed, survived): how many processes actually went away, and
+    how many shrugged us off. Every psutil call here is guarded -- one
+    untouchable PID must not abort the rest of the set, and it must not
+    escape into the caller's thread either.
+    """
     protected_pids = _self_pids()
 
     roots = []
     for pid in pids:
         try:
             proc = psutil.Process(pid)
-        except psutil.NoSuchProcess:
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue
         if _safe_to_kill(proc, protected_pids):
             roots.append(proc)
 
     if not roots:
-        return 0
+        return 0, 0
 
     # Browsers and editors fan out into helper processes; taking only the
     # parent leaves orphans behind.
@@ -1281,28 +1419,34 @@ def _terminate(pids):
             for child in proc.children(recursive=True):
                 if _safe_to_kill(child, protected_pids):
                     targets[child.pid] = child
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue
 
     procs = list(targets.values())
+    attempted = len(procs)
 
     if GRACEFUL_CLOSE and _request_window_close(targets.keys()):
-        _gone, procs = psutil.wait_procs(procs, timeout=GRACEFUL_TIMEOUT)
+        procs = _wait_gone(procs, GRACEFUL_TIMEOUT)
 
     for proc in procs:
         try:
             proc.terminate()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue
 
-    _gone, survivors = psutil.wait_procs(procs, timeout=1.0)
+    survivors = _wait_gone(procs, ESCALATE_TIMEOUT)
     for proc in survivors:
         try:
             proc.kill()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue
 
-    return len(targets)
+    remaining = _wait_gone(survivors, KILL_TIMEOUT)
+
+    # Count what died, not what we aimed at. The old version returned the
+    # size of the target set, so a close that was refused outright still
+    # reported success.
+    return attempted - len(remaining), len(remaining)
 
 
 def close_app(spoken):
@@ -1336,11 +1480,69 @@ def close_app(spoken):
         if not pids:
             continue
 
-        killed = _terminate(pids)
-        if killed:
+        # Drop anything that would kill Jarvis itself, and note why.
+        if self_guard is not None:
+            try:
+                pids, refused = self_guard.filter_pids(pids)
+            except Exception as e:
+                # A guard that malfunctions must not fail open. Refusing the
+                # close costs the user one manual click; failing open cost
+                # them their editor session once already.
+                print("app index: self-guard failed ({}) -- refusing".format(e))
+                return "Couldn't close {} -- my safety check didn't run".format(
+                    label
+                )
+
+            if not pids:
+                # Everything that matched was one of ours. STOP -- do not fall
+                # through to the next strategy. This strategy found the right
+                # processes and they are off limits; the remaining strategies
+                # are fuzzier, so continuing means killing something less
+                # likely to be what was asked for. That fall-through is how
+                # "close Claude Code" reached VS Code.
+                print("app index: {} matched only protected processes".format(how))
+                return (
+                    "Couldn't close {} -- {}, so closing it would shut me down"
+                    " too. Close it yourself and I'll keep running.".format(
+                        label, refused or "it's my own host"
+                    )
+                )
+
+        try:
+            killed, survived = _terminate(pids)
+        except Exception as e:
+            print("app index: terminate failed ({})".format(e))
+            return "Failed to close {}".format(label)
+
+        if killed and not survived:
             with _launched_lock:
                 _launched.pop(key, None)
             return "Closed {}".format(label)
+
+        if killed:
+            # Partial: some of the set went, some refused. Don't drop the
+            # tracked PIDs -- the survivors are still ours, and forgetting
+            # them costs us the most precise strategy on the next attempt.
+            #
+            # Worded with "Couldn't" deliberately: main.py decides whether to
+            # speak a correction by scanning these strings for it.
+            return (
+                "Closed part of {}, but couldn't close the rest"
+                " -- needs admin rights".format(label)
+            )
+
+        if survived:
+            # We found it and were refused. Task Manager, anything started as
+            # administrator, and most services land here: a medium-integrity
+            # process cannot terminate a high-integrity one, no matter how
+            # politely it asks.
+            #
+            # Stop rather than fall through. The remaining strategies are
+            # fuzzier than this one, and killing the wrong thing after failing
+            # on the right thing is the worst outcome available.
+            return "Couldn't close {}, it's running as administrator".format(
+                label
+            )
 
     return "Couldn't find '{}' running".format(spoken)
 
@@ -1376,6 +1578,12 @@ def explain(spoken, top=5):
 
 if __name__ == "__main__":
     import sys
+
+    if self_guard is not None:
+        print(self_guard.describe())
+        print()
+    else:
+        print("!! self_guard not importable -- close_app is unprotected\n")
 
     _ensure_catalog()
     if len(sys.argv) > 1:

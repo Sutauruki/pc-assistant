@@ -1,42 +1,104 @@
 """Persistent audio output, jitter buffer, and pitch-preserving time-stretch.
 
-Goes in: listener/audio_out.py
+Goes in: listener/audio_out.py   (replaces existing)
 
-One OutputStream stays open for the life of the process instead of being
-opened and torn down per reply (~50-200ms of WASAPI setup each time on
-Windows). Chunks are fed in as they arrive off the network, with a short
-prebuffer to absorb jitter.
+Optimized for Kokoro-ONNX local stream synthesis.
 """
 
-import queue
+import collections
 import threading
+import time
+import traceback
 
 import numpy as np
 import sounddevice as sd
+
+from listener import ui
 
 # Used to pre-warm the device at startup.
 DEFAULT_SAMPLE_RATE = 24000
 CHANNELS = 1
 BLOCKSIZE = 1024
 
-# Too low and a slow chunk causes an audible gap; too high and we hand back
-# the latency we just saved.
-PREBUFFER_SECONDS = 0.15
+# Device buffer to ask PortAudio for.
+OUTPUT_LATENCY = 0.12
+
+# Frames per stream.write().
+WRITE_FRAMES = BLOCKSIZE * 2
+
+# Waveform level granularity.
+VIS_SLICE_SECONDS = 1.0 / 30.0
+
+# --- Prebuffer Sizing (Tweaked for Local ONNX Inference) ---
+# Lower minimum prebuffer allows Kokoro to speak instantly without long opening lags.
+PREBUFFER_MIN_SECONDS = 0.10
+PREBUFFER_MAX_SECONDS = 0.80
+
+RATE_SAMPLE_SECONDS = 0.20
+RATE_MARGIN = 1.05
+JITTER_MARGIN = 0.08
+DEFICIT_SHARE = 0.30
+
+# --- Speed Governor Settings ---
+MIN_SPEED = 0.95
+SPEED_EASE_LOW = 0.15
+SPEED_EASE_HIGH = 0.40
+SPEED_EASE_RATE = 0.18
+
+# --- Reactive Net (Tuned for Punctuation Boundaries) ---
+REBUFFER_FLOOR_SECONDS = 0.20
+REBUFFER_GROWTH = 1.5
+REBUFFER_DECAY = 0.95
+REBUFFER_MIN_PAUSE = 0.08
+CLEAN_EVIDENCE_SECONDS = 1.5
+
+LOW_WATER_FRAMES = BLOCKSIZE
+
+# Grace period increased to absorb natural punctuation pauses in Kokoro TTS
+DRY_GRACE_SECONDS = 0.12
 
 _stream = None
 _stream_rate = None
 _stream_lock = threading.Lock()
 
+_learned = 0.0
+_learned_lock = threading.Lock()
+
+
+def learned_prebuffer():
+    with _learned_lock:
+        return _learned
+
+
+def _grow_learned():
+    global _learned
+    with _learned_lock:
+        _learned = min(
+            PREBUFFER_MAX_SECONDS,
+            max(REBUFFER_FLOOR_SECONDS, _learned * REBUFFER_GROWTH),
+        )
+        return _learned
+
+
+def _relax_learned():
+    global _learned
+    with _learned_lock:
+        _learned *= REBUFFER_DECAY
+        if _learned < PREBUFFER_MIN_SECONDS:
+            _learned = 0.0
+        return _learned
+
+
+def _rms(block):
+    if len(block) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(block.astype(np.float32) ** 2)))
+
 
 def get_stream(samplerate=DEFAULT_SAMPLE_RATE):
-    """Opens the shared output stream, reusing it across calls. Reopens only
-    if the requested sample rate differs from the open one."""
     global _stream, _stream_rate
     with _stream_lock:
         if _stream is not None and _stream_rate != samplerate:
-            print("output stream: {}Hz -> {}Hz (reopening)".format(
-                _stream_rate, samplerate
-            ))
             _stream.stop()
             _stream.close()
             _stream = None
@@ -48,6 +110,7 @@ def get_stream(samplerate=DEFAULT_SAMPLE_RATE):
                 channels=CHANNELS,
                 dtype="int16",
                 blocksize=BLOCKSIZE,
+                latency=OUTPUT_LATENCY,
             )
             _stream.start()
             _stream_rate = samplerate
@@ -65,40 +128,60 @@ def close_stream():
             _stream_rate = None
 
 
-class TimeStretcher:
-    """Speeds up speech without raising its pitch, incrementally.
+def play_blocking(samples, samplerate):
+    """Writes a short int16 mono buffer straight to the shared output stream.
 
-    Orpheus ignores the API's `speed` parameter, and simply playing samples
-    out faster would pitch-shift the voice into a chipmunk. WSOLA instead
-    drops overlapping windows of audio and cross-fades the seams, choosing
-    each seam where the waveforms line up best -- so periodicity survives and
-    pitch stays put.
+    listener/cues.py calls this for the two earcons (ready()/done()) -- a
+    couple hundred milliseconds of audio, way too short to be worth
+    spinning up a StreamingPlayer's prebuffer/jitter/speed-governor
+    machinery for. This reuses the same persistent device stream
+    (get_stream()) so a cue never fights TTS playback for the output
+    device, and writes in WRITE_FRAMES-sized chunks so a longer cue can't
+    hand PortAudio more than it wants in one call.
 
-    Works chunk-by-chunk so it can sit in the streaming path: samples are
-    stretched as they arrive rather than after the clip is complete.
+    Blocks until every sample has been handed to PortAudio. stream.write()
+    only guarantees the data is *buffered*, not that it's been heard --
+    cues.py's caller-side settle time (_settle_seconds()) accounts for the
+    remaining OUTPUT_LATENCY on top of this.
+
+    This was missing entirely before -- cues.py called it, got an
+    AttributeError every time, and the try/except in _play() swallowed it
+    silently ("cue failed (...) -- continuing without it"), which is why
+    the ready/done cues never actually played.
     """
+    if samples is None or len(samples) == 0:
+        return
+    stream = get_stream(samplerate)
+    for start in range(0, len(samples), WRITE_FRAMES):
+        stream.write(samples[start:start + WRITE_FRAMES])
+
+
+class TimeStretcher:
+    """WSOLA Time Stretcher. Bypassed during native 1.0x playback."""
 
     def __init__(self, speed, samplerate, frame=None, tolerance=None):
         self.speed = float(speed)
-
-        # ~43ms window: long enough to contain a pitch period at speaking
-        # fundamentals, short enough that seams stay inaudible.
         self.frame = int(frame or (samplerate * 0.043)) // 2 * 2
-        self.hop_s = self.frame // 2  # hanning at 50% overlap sums to unity
+        self.hop_s = self.frame // 2
         self.hop_a = max(1, int(round(self.hop_s * self.speed)))
         self.tolerance = int(tolerance or self.frame // 4)
 
         self.window = np.hanning(self.frame).astype(np.float32)
         self._buf = np.zeros(0, dtype=np.float32)
-        self._base = 0        # absolute sample index of _buf[0]
-        self._nominal = 0     # absolute index where the next window ideally starts
-        self._template = None # what should naturally follow the last window
+        self._base = 0
+        self._nominal = 0
+        self._template = None
+        self._last = None
         self._olap = np.zeros(self.hop_s, dtype=np.float32)
 
+    def set_speed(self, speed):
+        speed = max(0.5, min(2.0, float(speed)))
+        if abs(speed - self.speed) < 0.005:
+            return
+        self.speed = speed
+        self.hop_a = max(1, int(round(self.hop_s * speed)))
+
     def _best_start(self, nominal):
-        """Searches near `nominal` for the window that continues the previous
-        one most smoothly. This alignment is the whole trick -- a fixed hop
-        would cut mid-period and buzz."""
         if self._template is None:
             return nominal
 
@@ -106,7 +189,6 @@ class TimeStretcher:
         hi = nominal + self.tolerance
         best, best_score = nominal, -np.inf
 
-        # step 4 rather than 1: near-identical alignment at a quarter the cost
         for start in range(lo, hi + 1, 4):
             i = start - self._base
             seg = self._buf[i:i + self.frame]
@@ -121,7 +203,6 @@ class TimeStretcher:
         return best
 
     def feed(self, samples):
-        """int16 in, int16 out. Returns an empty array while filling."""
         if len(samples) == 0:
             return np.zeros(0, dtype=np.int16)
 
@@ -140,10 +221,13 @@ class TimeStretcher:
 
             follow = i + self.hop_s
             self._template = self._buf[follow:follow + self.frame].copy()
+            self._last = start
             self._nominal = start + self.hop_a
 
-            # discard what the search window can no longer reach
-            keep = (self._nominal - self.tolerance) - self._base
+            keep = min(
+                (self._nominal - self.tolerance) - self._base,
+                (self._last + self.hop_s) - self._base,
+            )
             if keep > self.frame * 4:
                 self._buf = self._buf[keep:]
                 self._base += keep
@@ -153,46 +237,59 @@ class TimeStretcher:
         return np.clip(np.concatenate(out), -32768, 32767).astype(np.int16)
 
     def flush(self):
-        """Emits the final overlap tail so the last word isn't clipped."""
-        tail = self._olap
+        if self._last is None:
+            rest = self._buf
+        else:
+            rest = self._buf[(self._last + self.hop_s) - self._base:]
+
         self._olap = np.zeros(self.hop_s, dtype=np.float32)
-        return np.clip(tail, -32768, 32767).astype(np.int16)
+        self._buf = np.zeros(0, dtype=np.float32)
+        self._template = None
+        self._last = None
+        self._base = 0
+        self._nominal = 0
+
+        if len(rest) == 0:
+            return np.zeros(0, dtype=np.int16)
+        return np.clip(rest, -32768, 32767).astype(np.int16)
 
 
 class StreamingPlayer:
-    """Accepts raw PCM bytes as they arrive and plays them in order.
-
-        player = StreamingPlayer(samplerate=24000, speed=1.25)
-        player.start()
-        for chunk in network_stream:
-            player.feed(chunk)
-        player.finish()   # blocks until queued audio has played out
-    """
-
     def __init__(self, samplerate=DEFAULT_SAMPLE_RATE, speed=1.0,
-                 on_first_audio=None):
+                 on_first_audio=None, expected_seconds=None):
         self.samplerate = samplerate
-        self._prebuffer_samples = int(samplerate * PREBUFFER_SECONDS)
+        self.speed = max(0.01, float(speed))
+        self.expected_seconds = expected_seconds
+        
+        # Only instantiate TimeStretcher if speed is explicitly non-1.0
         self._stretcher = (
             TimeStretcher(speed, samplerate) if abs(speed - 1.0) > 0.01 else None
         )
-        self._q = queue.Queue()
-        self._thread = None
-        self._leftover = b""
-        self._buffered = []
-        self._buffered_samples = 0
-        self._playing = False
         self._on_first_audio = on_first_audio
-        self._stop = threading.Event()
+
+        self._cv = threading.Condition()
+        self._chunks = collections.deque()
+        self._queued = 0
+        self._done = False
+        self._aborted = False
+        self._playing = False
+
+        self._t0 = None
+        self._produced = 0
+
+        self._speed_now = self.speed
+        self._speed_floor_seen = self.speed
+
+        self._leftover = b""
+        self._thread = None
+        self._warned_dry = False
 
     def start(self):
-        get_stream(self.samplerate)  # open up front, not on the first chunk
-        self._thread = threading.Thread(target=self._drain, daemon=True)
+        get_stream(self.samplerate)
+        self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def feed(self, pcm_bytes):
-        """Push raw little-endian int16 PCM. Chunk boundaries don't have to
-        land on sample boundaries -- the odd byte carries over."""
         if not pcm_bytes:
             return
 
@@ -206,71 +303,225 @@ class StreamingPlayer:
         samples = np.frombuffer(buf[:aligned], dtype=np.int16)
 
         if self._stretcher is not None:
+            self._adapt_speed()
             samples = self._stretcher.feed(samples)
 
         self._enqueue(samples)
 
+    def _adapt_speed(self):
+        if self._stretcher is None:
+            return
+
+        with self._cv:
+            queued = self._queued
+            playing = self._playing
+            aborted = self._aborted
+
+        if aborted or not playing:
+            return
+
+        seconds = queued / float(self.samplerate)
+
+        if seconds < SPEED_EASE_LOW:
+            goal = MIN_SPEED
+        elif seconds > SPEED_EASE_HIGH:
+            goal = self.speed
+        else:
+            return
+
+        current = self._speed_now
+        updated = current + (goal - current) * SPEED_EASE_RATE
+
+        if abs(goal - updated) < 0.01:
+            updated = goal
+
+        updated = max(MIN_SPEED, min(self.speed, updated))
+        if abs(updated - current) < 0.005:
+            return
+
+        self._speed_now = updated
+        if updated < self._speed_floor_seen:
+            self._speed_floor_seen = updated
+        self._stretcher.set_speed(updated)
+
     def _enqueue(self, samples):
         if len(samples) == 0:
             return
+        with self._cv:
+            if self._aborted:
+                return
+            if self._t0 is None:
+                self._t0 = time.monotonic()
+            self._chunks.append(samples)
+            self._queued += len(samples)
+            self._produced += len(samples)
+            self._cv.notify_all()
 
-        if self._playing:
-            self._q.put(samples)
-            return
-
-        self._buffered.append(samples)
-        self._buffered_samples += len(samples)
-        if self._buffered_samples >= self._prebuffer_samples:
-            self._flush_prebuffer()
-
-    def _flush_prebuffer(self):
-        self._playing = True
-        for block in self._buffered:
-            self._q.put(block)
-        self._buffered = []
-        self._buffered_samples = 0
-
-    def finish(self, timeout=30.0):
-        """Signals end of stream, waits for playback to drain."""
+    def finish(self, timeout=40.0):
         if self._stretcher is not None:
             self._enqueue(self._stretcher.flush())
-        if not self._playing:
-            # clip was shorter than the prebuffer -- play what we have
-            self._flush_prebuffer()
-        self._q.put(None)
+        with self._cv:
+            self._done = True
+            self._cv.notify_all()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
 
     def abort(self):
-        """Drops anything still queued. Hook for barge-in."""
-        self._stop.set()
-        try:
-            while True:
-                self._q.get_nowait()
-        except queue.Empty:
-            pass
-        self._q.put(None)
+        with self._cv:
+            self._aborted = True
+            self._done = True
+            self._chunks.clear()
+            self._queued = 0
+            self._cv.notify_all()
 
-    def _drain(self):
+    def _remaining_output_seconds(self):
+        if not self.expected_seconds:
+            return None
+        with self._cv:
+            produced = self._produced
+        total = self.expected_seconds / self.speed
+        return max(0.0, total - produced / float(self.samplerate))
+
+    def _required_prebuffer(self, floor):
+        if not self.expected_seconds:
+            return floor
+
+        with self._cv:
+            t0, produced = self._t0, self._produced
+
+        if t0 is None:
+            return floor
+        elapsed = time.monotonic() - t0
+        if elapsed < RATE_SAMPLE_SECONDS:
+            return floor
+
+        rate = (produced / float(self.samplerate)) / elapsed
+        rate /= RATE_MARGIN
+
+        need = OUTPUT_LATENCY + JITTER_MARGIN
+        if rate < 1.0:
+            playtime = self.expected_seconds / self.speed
+            need += playtime * (1.0 - rate) * DEFICIT_SHARE
+
+        return max(floor, min(PREBUFFER_MAX_SECONDS, need))
+
+    def _await_start(self):
+        floor = max(PREBUFFER_MIN_SECONDS, learned_prebuffer())
+
+        while True:
+            with self._cv:
+                queued, done, aborted = self._queued, self._done, self._aborted
+            if aborted or done:
+                return
+            target = self._required_prebuffer(floor)
+            if queued >= int(self.samplerate * target):
+                return
+            time.sleep(0.005)
+
+    def _dry_locked(self):
+        return (self._queued < LOW_WATER_FRAMES
+                and not self._done and not self._aborted)
+
+    def _take(self, want):
+        warn = None
+
+        with self._cv:
+            if self._dry_locked():
+                deadline = time.monotonic() + DRY_GRACE_SECONDS
+                while self._dry_locked():
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    self._cv.wait(timeout=left)
+
+            if self._dry_locked():
+                refill = _grow_learned()
+                left = self._remaining_output_seconds()
+                if left is not None:
+                    refill = min(refill, max(REBUFFER_MIN_PAUSE, left))
+
+                if not self._warned_dry:
+                    self._warned_dry = True
+                    warn = refill
+
+                need = int(self.samplerate * refill)
+                while (self._queued < need
+                        and not self._done and not self._aborted):
+                    self._cv.wait(timeout=0.1)
+
+            while (self._queued == 0
+                    and not self._done and not self._aborted):
+                self._cv.wait(timeout=0.1)
+
+            if self._aborted or self._queued == 0:
+                block = None
+            else:
+                out = []
+                taken = 0
+                while self._chunks and taken < want:
+                    chunk = self._chunks[0]
+                    room = want - taken
+                    if len(chunk) <= room:
+                        self._chunks.popleft()
+                    else:
+                        chunk, self._chunks[0] = chunk[:room], chunk[room:]
+                    out.append(chunk)
+                    taken += len(chunk)
+                self._queued -= taken
+                block = out[0] if len(out) == 1 else np.concatenate(out)
+
+        if warn is not None:
+            print("speech: buffer ran dry, holding {:.2f}s".format(warn))
+
+        return block
+
+    def _publish_levels(self, block, lag):
+        step = max(1, int(self.samplerate * VIS_SLICE_SECONDS))
+        for index, start in enumerate(range(0, len(block), step)):
+            piece = block[start:start + step]
+            ui.push_rms(
+                _rms(piece), delay=lag + index * VIS_SLICE_SECONDS
+            )
+
+    def _run(self):
+        try:
+            self._play()
+        except Exception as e:
+            print("playback failed: {}".format(e))
+            traceback.print_exc()
+            try:
+                close_stream()
+            except Exception:
+                pass
+
+    def _play(self):
         stream = get_stream(self.samplerate)
+
+        try:
+            lag = float(stream.latency) + BLOCKSIZE / float(self.samplerate)
+        except Exception:
+            lag = BLOCKSIZE / float(self.samplerate)
+
+        self._await_start()
+
+        with self._cv:
+            self._playing = True
+
         first = True
-        while not self._stop.is_set():
-            block = self._q.get()
+        while not self._aborted:
+            block = self._take(WRITE_FRAMES)
             if block is None:
                 break
+
             if first:
                 first = False
-                if self._on_first_audio is not None:
+                if self._on_first_audio:
                     try:
                         self._on_first_audio()
                     except Exception:
                         pass
-            stream.write(block.reshape(-1, CHANNELS))
 
+            self._publish_levels(block, lag)
+            stream.write(block)
 
-def play_blocking(samples, samplerate=DEFAULT_SAMPLE_RATE):
-    """Plays an already-complete int16 array on the shared stream."""
-    if samples is None or len(samples) == 0:
-        return
-    stream = get_stream(samplerate)
-    stream.write(np.asarray(samples, dtype=np.int16).reshape(-1, CHANNELS))
+        _relax_learned()

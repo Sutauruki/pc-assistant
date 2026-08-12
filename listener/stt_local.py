@@ -18,6 +18,11 @@ COMMAND_VOCAB = [
     "to", "the", "percent",
     "zero", "ten", "twenty", "thirty", "forty", "fifty",
     "sixty", "seventy", "eighty", "ninety", "hundred",
+    "vs code", "visual studio code", "visual studio", "studio",
+    "claude code", "claude", "code", "claude code command",
+    "git", "github", "gitlab", "git hub", "git lab",
+    "terminal", "where is",
+    "command prompt", "cmd", "terminal", "powershell",
     "[unk]"
 ]
 

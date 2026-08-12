@@ -1,4 +1,5 @@
-idea.txt
+*.txt
+!requirements.txt
 text_*.txt
 models
 __pycache__
@@ -9,3 +10,6 @@ venv
 !.env.example
 *.zip
 cache
+*.md
+*.onnx
+*.onnx.json
