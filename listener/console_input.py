@@ -36,22 +36,47 @@ no echo, the line under construction is handed to ui.set_input(), and the
 panel draws it as one of its own rows. Nothing outside ui.py ever moves the
 cursor, which is the invariant the whole dashboard rests on.
 
-SHIFT+ENTER
------------
-Adds a line break to the buffer instead of submitting it -- standard
-multi-line-input behaviour. This is Windows-only, and has to be: a console
-in its normal *cooked* mode translates a keypress to a character before
-Python ever sees it, and Shift+Enter translates to exactly the same "\r" a
-bare Enter does -- the modifier is thrown away before it reaches getwch() or
-anything else reading translated characters. The only way to tell them apart
-is to read the *untranslated* key event straight off the Win32 console API
-(ReadConsoleInputW), which still carries the virtual key code and the
-control-key-state bitmask. That's what _read_windows() does now, in place of
-msvcrt.getwch() -- same POLL_SECONDS-interval polling via PeekConsoleInputW
-first, same _handle() dispatch for every key that isn't Enter, just a
-lower-level source of key data. _read_posix() is unchanged and can't gain
-this: a plain POSIX tty has no equivalent channel, so Enter always submits
-there. See _read_windows()'s docstring for the struct-layout details.
+SHIFT+ENTER, AND WHY CTRL+J IS HERE TOO
+----------------------------------------
+Shift+Enter adds a line break to the buffer instead of submitting it --
+standard multi-line-input behaviour. On Windows, _read_windows() reads the
+*untranslated* key event straight off the Win32 console API
+(ReadConsoleInputW), which carries the virtual key code and the
+control-key-state bitmask a cooked read throws away, so the shift modifier
+on VK_RETURN is visible and dispatched to _insert_newline().
+
+That said, Shift+Enter alone isn't reliable everywhere: Windows Terminal
+and VS Code's integrated terminal run child processes behind a pseudo
+console (ConPTY), which reconstructs INPUT_RECORDs from an incoming VT
+byte stream rather than handing over real hardware key events. Modern
+Windows Terminal versions do forward full modifier state for this
+(win32-input-mode), but not every terminal/version does, and when it
+doesn't, the SHIFT_PRESSED bit silently reads as unset -- Shift+Enter then
+just submits like a bare Enter, with nothing to indicate why.
+
+So there's a second, independent trigger: Ctrl+J (linefeed, "\x0a"). Ctrl
+plus a letter is a distinct virtual key + modifier combination, not a
+modified Enter, so it isn't subject to the same VT-reconstruction gap --
+it reads correctly through ConPTY as well as a native console. It's wired
+in both readers:
+
+  * _read_windows(): checked as VK 'J' + a CTRL bit, same as the
+    Shift+Enter check right above it.
+  * _read_posix(): Ctrl+J physically sends the raw byte 0x0a regardless of
+    terminal, so as long as nothing on the way in remaps it to something
+    else, _handle() can treat it as "insert newline" directly. The one
+    thing that *does* remap it is covered below.
+
+_read_posix() and Enter-vs-Ctrl+J
+----------------------------------
+A tty's ICRNL input flag translates an incoming "\r" to "\n" before a
+reading process ever sees it, and tty.setcbreak() (used here to turn off
+line buffering and echo) doesn't touch that flag -- it's normally still on
+from whatever the shell set up. Left alone, that means plain Enter would
+also show up as "\n", making it indistinguishable from an intentional
+Ctrl+J. _read_posix() now clears ICRNL for the duration of the reader (see
+its docstring), so Enter reliably arrives as "\r" and Ctrl+J as "\n" --
+the same distinction _handle() relies on.
 
 POLLED, NOT BLOCKING
 --------------------
@@ -80,16 +105,21 @@ POLL_SECONDS = 0.025
 # parser has to send it to the model, and the model has a context limit.
 MAX_INPUT_CHARS = 500
 
-HINT = "type a command, or say \"hey jarvis\""
+HINT = "type a command (shift+enter or ctrl+j for a new line), or say \"hey jarvis\""
 
 # --- control characters ----------------------------------------------------
 
 _CTRL_C = "\x03"
 _CTRL_D = "\x04"
+_CTRL_J = "\x0a"  # Ctrl+J / linefeed -- the cross-terminal newline shortcut,
+                  # see "SHIFT+ENTER, AND WHY CTRL+J IS HERE TOO" above.
 _CTRL_U = "\x15"
 _CTRL_W = "\x17"
 _BACKSPACE = ("\x08", "\x7f")
-_ENTER = ("\r", "\n")
+# "\n" used to live here too, back when Enter and Ctrl+J were
+# indistinguishable on POSIX. Now that _read_posix() clears ICRNL, "\n"
+# means an actual Ctrl+J and gets its own branch in _handle() below.
+_ENTER = ("\r",)
 _ESCAPE = "\x1b"
 
 _queue = queue.Queue()
@@ -171,6 +201,10 @@ def _handle(char):
         _submit()
         return True
 
+    if char == _CTRL_J:
+        _insert_newline()
+        return True
+
     if char in _BACKSPACE:
         _backspace()
         return True
@@ -215,7 +249,11 @@ def _handle(char):
 # --- platform readers ------------------------------------------------------
 
 _VK_RETURN = 0x0D
+_VK_J = 0x4A
 _SHIFT_PRESSED = 0x0010  # dwControlKeyState bit; ignores caps/num lock etc.
+_LEFT_CTRL_PRESSED = 0x0008
+_RIGHT_CTRL_PRESSED = 0x0004
+_CTRL_PRESSED = _LEFT_CTRL_PRESSED | _RIGHT_CTRL_PRESSED
 _KEY_EVENT = 0x0001
 _STD_INPUT_HANDLE = -10
 
@@ -306,6 +344,17 @@ def _read_windows():
                 _submit()
             continue
 
+        # Second, independent path to the same action -- see "SHIFT+ENTER,
+        # AND WHY CTRL+J IS HERE TOO" in the module docstring for why
+        # Shift+Enter alone isn't always enough under Windows Terminal/VS
+        # Code. Checked by virtual key + modifier rather than UnicodeChar
+        # so it doesn't depend on the console populating that field for a
+        # Ctrl-modified key.
+        if (key.wVirtualKeyCode == _VK_J
+                and key.dwControlKeyState & _CTRL_PRESSED):
+            _insert_newline()
+            continue
+
         char = key.UnicodeChar
         if not char or char == "\x00":
             # A function/navigation/modifier key with no character of its
@@ -323,13 +372,19 @@ def _read_posix():
 
     No Shift+Enter here -- a plain tty hands over a translated byte stream
     with no modifier-key channel at all (that's what _read_windows() reads
-    around by going straight to the Win32 console API instead). Enter always
-    submits on this path; there's nothing broken to fix, just a capability
-    Windows happens to expose that POSIX ttys don't.
+    around by going straight to the Win32 console API instead). Enter
+    always submits on this path. Ctrl+J still works for a newline though --
+    see "SHIFT+ENTER, AND WHY CTRL+J IS HERE TOO" in the module docstring.
 
     cbreak rather than full raw: it leaves output post-processing alone, so
     the panel's own writes still behave, while turning off line buffering and
-    echo -- which is all we need.
+    echo -- which is all we need. tty.setcbreak() doesn't touch input flags
+    though, so ICRNL -- on by default on most ttys -- would still translate
+    an incoming "\\r" (Enter) into "\\n" before we ever see it, making it
+    indistinguishable from an intentional Ctrl+J. Clearing just that one
+    input flag below (not going to tty.setraw()'s full raw mode, which would
+    also touch output post-processing) keeps Enter as "\\r" and Ctrl+J as
+    "\\n" -- exactly the distinction _handle() needs.
     """
     import select
     import termios
@@ -339,6 +394,9 @@ def _read_posix():
     saved = termios.tcgetattr(fd)
     try:
         tty.setcbreak(fd)
+        mode = termios.tcgetattr(fd)
+        mode[0] &= ~termios.ICRNL  # mode[0] is iflag
+        termios.tcsetattr(fd, termios.TCSANOW, mode)
         while not _stop.is_set():
             ready, _, _ = select.select([fd], [], [], POLL_SECONDS)
             if not ready:

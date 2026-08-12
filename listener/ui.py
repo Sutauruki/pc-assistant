@@ -63,26 +63,39 @@ THINKING = "THINKING"
 SPEAKING = "SPEAKING"
 
 # Label plus the accent colour the whole panel takes on in that state.
+# Colours ported straight from the HTML mockup's `params` table (idle,
+# listening, thinking, speaking) so the reskinned panel and the mockup
+# read as the same design. RECORDING has no equivalent there -- it's this
+# project's own state for "mic is actively capturing," distinct from
+# LISTENING's "waiting for the wake word" -- so it keeps its own colour,
+# an amber that sits clearly apart from the other four.
 _STATE_STYLE = {
-    IDLE:      ("IDLE",      (95, 105, 120)),
-    LISTENING: ("LISTENING", (60, 200, 205)),
+    IDLE:      ("IDLE",      (86, 94, 104)),
+    LISTENING: ("LISTENING", (93, 202, 165)),
     RECORDING: ("RECORDING", (250, 170, 65)),
-    THINKING:  ("THINKING",  (170, 130, 255)),
-    SPEAKING:  ("SPEAKING",  (95, 220, 145)),
+    THINKING:  ("THINKING",  (175, 157, 236)),
+    SPEAKING:  ("SPEAKING",  (63, 212, 160)),
 }
 
 # --- Tunables --------------------------------------------------------------
 
 FPS = 24
 MAX_WIDTH = 84
-WAVE_ROWS = 5
 
-# How fast a bar falls when no fresh audio arrives. Without this the wave
-# freezes mid-stride on every pause instead of settling.
+# Ring size, in terminal columns. Rows are derived from this (see
+# _ring_rows_count) so the shape stays round rather than egg-shaped --
+# don't set rows independently.
+RING_MIN_COLS = 8
+RING_MAX_COLS = 16
+
+# How fast the ring's audio-reactive swell falls back to its state
+# baseline when no fresh level arrives. Same role DECAY played for the old
+# bar wave.
 DECAY = 0.72
 
-# Height of the idle swell drawn while waiting on the model. Low enough that
-# it never reads as real audio.
+# Height of the idle swell drawn while waiting on the model, on top of
+# THINKING's own baseline ring amplitude. Low enough that it never reads
+# as real audio.
 THINK_AMPLITUDE = 0.22
 
 # Ceiling on the playback delay line. A device reporting an absurd latency
@@ -106,8 +119,12 @@ DIM_RGB = (108, 116, 132)
 _SPINNER = "◐◓◑◒"
 _SPINNER_ASCII = "|/-\\"
 
-_BLOCKS = " ▁▂▃▄▅▆▇█"
-_BLOCKS_ASCII = " .:-=+*#@"
+# Half-block ring rendering. Two vertical "pixels" pack into one terminal
+# row -- "top"/"bottom" each colour one half of the cell, "full" is both
+# halves lit. See Dashboard._ring_rows()'s docstring for why this is what
+# makes the ring round instead of egg-shaped.
+_RING_UNICODE = {"top": "▀", "bottom": "▄", "full": "█"}
+_RING_ASCII = {"top": "\"", "bottom": ",", "full": "#"}
 
 _BOX_UNICODE = {
     "tl": "╭", "tr": "╮", "bl": "╰", "br": "╯",
@@ -120,6 +137,28 @@ _BOX_ASCII = {
     "h": "-", "v": "|", "ml": "+", "mr": "+",
     "dot": "*", "prompt": ">", "reply": "*", "sep": "-",
     "typed": ">", "caret": "_",
+}
+
+# Four-stop colour cycle the ring sweeps through as it goes around --
+# lifted directly from the HTML mockup's grad() function (teal -> blue ->
+# deep blue -> violet).
+_RING_GRADIENT = ((63, 212, 160), (42, 181, 208), (28, 157, 234), (127, 119, 221))
+
+# Per-state ring motion, ported from the mockup's `params` table:
+#   speed -- how fast the wobble travels around the ring
+#   amp   -- baseline wobble depth (fraction of ring radius) with no audio
+#   buzz  -- fast, small-amplitude jitter layered on top
+#   reactivity -- how much extra `amp` the *real* current audio level
+#                 (self._last_level) contributes on top of the baseline.
+#                 This is the one thing with no equivalent in the mockup,
+#                 which only ever animates against a canned sine -- here
+#                 the ring genuinely swells with real mic/speaker level.
+_RING_PARAMS = {
+    IDLE:      dict(speed=0.2, amp=0.05, buzz=0.015, reactivity=0.10),
+    LISTENING: dict(speed=0.6, amp=0.09, buzz=0.04,  reactivity=0.35),
+    RECORDING: dict(speed=0.9, amp=0.13, buzz=0.05,  reactivity=0.55),
+    THINKING:  dict(speed=1.1, amp=0.17, buzz=0.05,  reactivity=0.10),
+    SPEAKING:  dict(speed=1.8, amp=0.20, buzz=0.12,  reactivity=0.60),
 }
 
 
@@ -242,7 +281,6 @@ class Dashboard(object):
         self._active = False
 
         self._state = IDLE
-        self._wave = []
         self._pending = None
         self._delayed = []
         self._last_level = 0.0
@@ -268,7 +306,7 @@ class Dashboard(object):
         self._proxy = None
         self._err_proxy = None
         self._box = _BOX_UNICODE
-        self._blocks = _BLOCKS
+        self._ring_chars = _RING_UNICODE
         self._spinner = _SPINNER
         self._ellipsis = "…"
 
@@ -301,11 +339,11 @@ class Dashboard(object):
                 return False
 
             if not _can_encode(
-                _BOX_UNICODE["tl"] + _BLOCKS[-1] + _SPINNER[0] + "…"
+                _BOX_UNICODE["tl"] + _RING_UNICODE["full"] + _SPINNER[0] + "…"
                 + _BOX_UNICODE["typed"] + _BOX_UNICODE["caret"]
             ):
                 self._box = _BOX_ASCII
-                self._blocks = _BLOCKS_ASCII
+                self._ring_chars = _RING_ASCII
                 self._spinner = _SPINNER_ASCII
                 self._ellipsis = "..."
 
@@ -531,17 +569,28 @@ class Dashboard(object):
                 level = 0.0
 
         self._last_level = level
-
-        width = self._wave_width()
-        self._wave.append(level)
-        if len(self._wave) > width:
-            del self._wave[:len(self._wave) - width]
-
         self._spin = (self._spin + 1) % (len(self._spinner) * 4)
 
-    def _wave_width(self):
-        """Columns of history to keep. Matches what _frame_locked draws."""
-        return max(8, self._panel_width() - 6)
+    def _ring_cols(self):
+        """Ring width in terminal columns, scaled with the panel like the
+        old _wave_width() was, capped so the ring neither dominates a wide
+        terminal nor vanishes on a narrow one. Kept even so the two
+        vertical half-block pixels per row split cleanly.
+        """
+        inner = self._panel_width() - 4
+        cols = max(RING_MIN_COLS, min(RING_MAX_COLS, inner - 4))
+        return cols if cols % 2 == 0 else cols - 1
+
+    def _ring_rows_count(self, cols):
+        """Half as many terminal rows as columns.
+
+        Two vertical pixels pack into each row via the half-block trick, so
+        the vertical pixel count is already `2 * rows`. A monospace cell is
+        roughly twice as tall as it is wide, so halving that vertical step
+        brings pixel width and pixel height back to about the same physical
+        size -- without this the ring renders as an oval, not a circle.
+        """
+        return max(3, cols // 2)
 
     def _terminal_size(self):
         try:
@@ -633,14 +682,14 @@ class Dashboard(object):
             + border + " " + box["h"] + box["tr"] + reset
         )
 
-        # --- waveform
-        # Derived from `inner` rather than re-measuring the terminal: a resize
-        # between the two reads would put the wave and the borders on
-        # different widths for a frame.
-        wave_width = max(8, inner - 2)
-        for row in self._wave_rows(wave_width, accent):
+        # --- ring
+        # Derived from `inner` rather than re-measuring the terminal, same
+        # reasoning as the old wave: a resize between the two reads would
+        # put the ring and the borders on different widths for a frame.
+        ring_cols = self._ring_cols()
+        for row in self._ring_rows(ring_cols, accent):
             rows.append(
-                self._pad_row(row, wave_width, inner, border, center=True)
+                self._pad_row(row, ring_cols, inner, border, center=True)
             )
 
         rows.append(
@@ -677,37 +726,93 @@ class Dashboard(object):
 
         return "\n".join(rows)
 
-    def _wave_rows(self, width, accent):
-        """Bars, tallest at the top, with an eight-level tip per cell.
+    def _ring_params(self):
+        """Current (t, speed, amp, buzz) for the wobble formula below.
 
-        Mirroring around a centre line was the first instinct, but the block
-        characters only fill upward -- there's no eight-step set that fills
-        from the top of a cell -- so a mirrored wave ends up visibly coarser
-        on the bottom half. Single-sided keeps the resolution even.
+        `amp` is the state's baseline (_RING_PARAMS) plus a share of
+        self._last_level -- the same value _advance_locked() already
+        maintains for every state (decayed audio, real pushed levels, or
+        THINKING's own idle swell). That's what makes the ring audio-
+        reactive rather than a fixed per-state performance.
         """
-        wave = self._wave
-        pad = width - len(wave)
-        values = ([0.0] * pad + wave) if pad > 0 else wave[-width:]
+        t = self._tick / float(FPS)
+        p = _RING_PARAMS.get(self._state, _RING_PARAMS[IDLE])
+        amp = p["amp"] + self._last_level * p["reactivity"]
+        return t, p["speed"], amp, p["buzz"]
 
-        blocks = self._blocks
-        top = len(blocks) - 1
-        base = _mix(accent, (18, 20, 26), 0.55)
+    def _ring_gradient(self, frac):
+        """Position around the ring (0..1) -> an RGB colour, cycling
+        through _RING_GRADIENT's four stops. Same shape as the mockup's
+        grad() function."""
+        stops = _RING_GRADIENT
+        f = (frac % 1.0) * len(stops)
+        i = int(f) % len(stops)
+        return _mix(stops[i], stops[(i + 1) % len(stops)], f - int(f))
 
-        rows = []
-        for row in range(WAVE_ROWS - 1, -1, -1):
-            # Brighter toward the top of the panel, so peaks read as peaks.
-            shade = _fg(_mix(base, accent, (row + 0.5) / WAVE_ROWS))
-            cells = []
-            for value in values:
-                filled = value * WAVE_ROWS - row
-                if filled <= 0.0:
-                    cells.append(" ")
-                elif filled >= 1.0:
-                    cells.append(blocks[top])
-                else:
-                    cells.append(blocks[max(1, int(filled * top))])
-            rows.append(shade + "".join(cells) + "\x1b[0m")
-        return rows
+    def _half_block(self, top, bottom):
+        """One terminal cell from two vertical pixels' colours (or None if
+        unlit). Foreground-only -- no background codes -- so the ring
+        draws as coloured strokes on whatever the terminal's own
+        background is, same philosophy as the rest of the panel."""
+        chars = self._ring_chars
+        if top is not None and bottom is not None:
+            return _fg(_mix(top, bottom, 0.5)) + chars["full"] + "\x1b[0m"
+        if top is not None:
+            return _fg(top) + chars["top"] + "\x1b[0m"
+        if bottom is not None:
+            return _fg(bottom) + chars["bottom"] + "\x1b[0m"
+        return " "
+
+    def _ring_rows(self, cols, accent):
+        """The circular, audio-reactive centrepiece -- the terminal
+        analogue of the HTML mockup's canvas blob ring.
+
+        Every pixel's angle and distance from centre are tested against a
+        wobbled ring radius, using the same three-harmonic shape the
+        mockup's canvas script draws with (a slow orbit term, a faster
+        ripple, and a buzz term) -- see _ring_params() for where the
+        numbers come from. A pixel within ~1 unit of that radius is lit
+        and coloured by its angle via _ring_gradient(); everything else is
+        blank except a small solid core at dead centre, mirroring the
+        little centre dot the mockup always draws regardless of state.
+
+        Two vertical pixels pack into each terminal row -- see
+        _ring_rows_count()'s docstring for why that specifically is what
+        keeps this round instead of egg-shaped.
+        """
+        rows_count = self._ring_rows_count(cols)
+        vpx = rows_count * 2
+        t, speed, amp, buzz = self._ring_params()
+        base_r = min(cols, vpx) * 0.5 * 0.62
+        cx = (cols - 1) / 2.0
+        cy = (vpx - 1) / 2.0
+        core = _mix(accent, (255, 255, 255), 0.35)
+
+        def lit(x, y):
+            dx = x - cx
+            dy = y - cy
+            radius = math.hypot(dx, dy)
+            if radius < 1.2:
+                return core
+            angle = math.atan2(dy, dx)
+            wobble = (
+                math.sin(angle * 3 + t * speed * 2) * amp
+                + math.sin(angle * 5 - t * 3.1) * amp * 0.45
+                + math.sin(t * 9 + angle * 2) * buzz
+            )
+            ring_r = base_r * (1.0 + wobble)
+            if abs(radius - ring_r) > 1.05:
+                return None
+            return self._ring_gradient(angle / (2 * math.pi) + t * 0.05)
+
+        out = []
+        for r in range(rows_count):
+            cells = [
+                self._half_block(lit(c, r * 2), lit(c, r * 2 + 1))
+                for c in range(cols)
+            ]
+            out.append("".join(cells))
+        return out
 
     def _pad_row(self, painted, visible_len, inner, border, center=False):
         """Wraps one row of already-coloured content in the panel borders.

@@ -60,26 +60,14 @@ DONE_NOTES = (
     (523.25, 0.060, 0.180, 0.95),   # C5
 )
 
-# Extra quiet time after the samples are written before we call the sound
-# finished. stream.write() returns once the data is *buffered*, not once it
-# has been heard, so the device still has up to OUTPUT_LATENCY of audio in
-# hand. Without this the ready cue is still sounding when the mic opens.
-#
-# Deliberately NOT a module-level constant anymore. audio_out.py imports
-# this module (`from listener import ui` pulls in ui.py, which imports
-# cues.py, which imports audio_out.py) *before* audio_out.py finishes
-# defining OUTPUT_LATENCY further down its own file -- so reading it here at
-# import time only worked when something else happened to import ui.py (or
-# cues.py) before it imported audio_out.py directly. Whichever module a
-# process imports *first* decides whether that accident holds -- main.py's
-# import order happened to keep it true, but `python -m listener.tts_local`
-# imports audio_out.py first and broke it: "partially initialized module
-# 'listener.audio_out' has no attribute 'OUTPUT_LATENCY'". Reading the value
-# lazily, at call time instead of import time, means audio_out.py has always
-# finished loading by the time anyone asks -- correct regardless of which
-# module happens to be the process's entry point.
+
 def _settle_seconds():
+    """Extra quiet time after samples are written before calling sound finished.
+    
+    Evaluated lazily at call time to avoid circular import errors with audio_out.
+    """
     return audio_out.OUTPUT_LATENCY + 0.02
+
 
 _cache = {}
 _lock = threading.Lock()
@@ -87,13 +75,7 @@ _enabled = os.environ.get("JARVIS_NO_CUES") is None
 
 
 def _current_rate():
-    """The rate the shared output stream is already open at.
-
-    get_stream() closes and reopens the device when asked for a different
-    rate, and a reopen mid-turn is both slow and audible. Matching whatever
-    is open means a cue never causes one -- tts pins 24kHz, so in practice
-    these agree, but reading it keeps that from being an assumption.
-    """
+    """The rate the shared output stream is already open at."""
     rate = getattr(audio_out, "_stream_rate", None)
     try:
         return int(rate) if rate else int(audio_out.DEFAULT_SAMPLE_RATE)
@@ -113,8 +95,7 @@ def _envelope(count, rate):
 
     attack = min(int(ATTACK_SECONDS * rate), count)
     if attack > 1:
-        # Raised cosine rather than a straight line: the slope starts at zero,
-        # so there is no corner in the waveform to hear.
+        # Raised cosine slope starts at zero to avoid wave corners/clicks
         env[:attack] *= 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, attack))
 
     release = min(int(RELEASE_SECONDS * rate), count)
@@ -130,8 +111,7 @@ def _note(freq, seconds, rate):
         return np.zeros(0)
 
     t = np.arange(count) / float(rate)
-    # Zero phase at t=0 for every partial, so the note begins at amplitude
-    # zero and the attack ramp has nothing to fight.
+    # Zero phase at t=0 for every partial
     wave = np.zeros(count)
     for multiple, amplitude in HARMONICS:
         wave += amplitude * np.sin(2.0 * np.pi * freq * multiple * t)
@@ -148,8 +128,7 @@ def _render(notes, rate):
         offset = int(start * rate)
         buf[offset:offset + len(segment)] += segment
 
-    # Normalise then scale, so both cues land at the same perceived level no
-    # matter how their partials happened to add up.
+    # Normalize then scale for consistent perceived levels
     peak = float(np.max(np.abs(buf))) if len(buf) else 0.0
     if peak > 0:
         buf /= peak
@@ -185,22 +164,12 @@ def _play(name, notes, wait):
 
 
 def ready(wait=True):
-    """Mic is live. Blocks until the sound has actually finished.
-
-    Blocking is the point. record.py calibrates its noise floor from the
-    opening chunks of the recording, so a cue still ringing when the mic
-    opens gets measured as room noise and pushes the speech gate up -- quiet
-    speech then fails to register as speech at all.
-    """
+    """Mic is live. Blocks until the sound has actually finished[cite: 6]."""
     return _play("ready", READY_NOTES, wait)
 
 
 def done(wait=False):
-    """Recording closed, thinking now.
-
-    Fire and forget by default: transcription starts immediately and there is
-    nothing left to protect from bleed.
-    """
+    """Recording closed, thinking now[cite: 6]. Fire and forget by default[cite: 6]."""
     if not _enabled:
         return
     if wait:
@@ -212,12 +181,7 @@ def done(wait=False):
 
 
 def warm():
-    """Renders both cues up front so the first one isn't late.
-
-    Only matters once -- generation is sub-millisecond -- but the first cue
-    is also the first thing the speaker plays, and doing it at startup means
-    any device wake-up happens before it is standing between you and talking.
-    """
+    """Renders both cues up front so the first one isn't late[cite: 6]."""
     if not _enabled:
         return
     try:
@@ -228,8 +192,6 @@ def warm():
 
 
 if __name__ == "__main__":
-    # Hear them without running the assistant. Tune CUE_VOLUME and the note
-    # tables against this rather than against a live turn.
     audio_out.get_stream()
     print("ready cue (rising -- talk now)")
     ready()

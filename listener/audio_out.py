@@ -128,6 +128,34 @@ def close_stream():
             _stream_rate = None
 
 
+def play_blocking(samples, samplerate):
+    """Writes a short int16 mono buffer straight to the shared output stream.
+
+    listener/cues.py calls this for the two earcons (ready()/done()) -- a
+    couple hundred milliseconds of audio, way too short to be worth
+    spinning up a StreamingPlayer's prebuffer/jitter/speed-governor
+    machinery for. This reuses the same persistent device stream
+    (get_stream()) so a cue never fights TTS playback for the output
+    device, and writes in WRITE_FRAMES-sized chunks so a longer cue can't
+    hand PortAudio more than it wants in one call.
+
+    Blocks until every sample has been handed to PortAudio. stream.write()
+    only guarantees the data is *buffered*, not that it's been heard --
+    cues.py's caller-side settle time (_settle_seconds()) accounts for the
+    remaining OUTPUT_LATENCY on top of this.
+
+    This was missing entirely before -- cues.py called it, got an
+    AttributeError every time, and the try/except in _play() swallowed it
+    silently ("cue failed (...) -- continuing without it"), which is why
+    the ready/done cues never actually played.
+    """
+    if samples is None or len(samples) == 0:
+        return
+    stream = get_stream(samplerate)
+    for start in range(0, len(samples), WRITE_FRAMES):
+        stream.write(samples[start:start + WRITE_FRAMES])
+
+
 class TimeStretcher:
     """WSOLA Time Stretcher. Bypassed during native 1.0x playback."""
 

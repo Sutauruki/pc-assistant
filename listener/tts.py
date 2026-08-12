@@ -131,6 +131,26 @@ RESPONSE_FORMAT = "wav"
 # natural pace.
 SPEECH_SPEED = 1.15
 
+# --- Direct vs tweaked audio --------------------------------------------
+# 1 = "direct audio": skip the WSOLA time-stretch above entirely and play
+#     Groq's speech back at its native pace -- the StreamingPlayer never
+#     even builds a TimeStretcher (see its __init__: it only instantiates
+#     one when speed differs from 1.0 by more than 0.01).
+# 0 = "tweaked audio" (default): stretch to SPEECH_SPEED as described
+#     above.
+# Env override: JARVIS_DIRECT_AUDIO=1
+DIRECT_AUDIO = int(os.environ.get("JARVIS_DIRECT_AUDIO", "0"))
+
+# --- Local-first vs cloud-first -----------------------------------------
+# 0 = cloud (Groq/Orpheus) first, falling back to the local Kokoro voice
+#     only if the cloud path produces no audio at all (default -- best
+#     quality when you're online).
+# 1 = local (Kokoro) first, falling back to cloud only if the local model
+#     can't produce audio (e.g. model files missing) -- for working
+#     offline-first, or keeping cloud TTS spend down.
+# Env override: JARVIS_TTS_LOCAL_FIRST=1
+TTS_LOCAL_FIRST = int(os.environ.get("JARVIS_TTS_LOCAL_FIRST", "0"))
+
 # Rough speaking rate of the *source* audio, used only to tell the player how
 # much is coming so it can size its prebuffer and cap its recovery pauses.
 #
@@ -625,7 +645,7 @@ def _play(pieces, on_first_audio=None, expected_chars=None):
                 rate = chunk_rate or SAMPLE_RATE
                 player = StreamingPlayer(
                     samplerate=rate,
-                    speed=SPEECH_SPEED,
+                    speed=(1.0 if DIRECT_AUDIO else SPEECH_SPEED),
                     on_first_audio=on_first_audio,
                     # Lets the player work out how much to hold back before it
                     # starts, and how long a mid-reply refill is allowed to
@@ -699,9 +719,21 @@ def speak(text, on_first_audio=None):
     Never raises. If Groq produces no audio at all for this reply (offline,
     rate limited, bad key, terms not accepted), falls back to
     listener/tts_local.py (Kitten TTS, offline) rather than going silent.
+
+    Order is controlled by TTS_LOCAL_FIRST above: cloud-first (default)
+    tries Groq and falls back to local; local-first tries Kokoro and falls
+    back to cloud. Either way, the other tier only gets a turn if the
+    first one produces zero audio.
     """
     if not text or not text.strip():
         return None
+
+    if TTS_LOCAL_FIRST:
+        player = tts_local.speak(text, on_first_audio=on_first_audio)
+        if player is not None:
+            return player
+        print("tts: local speech unavailable, falling back to cloud voice")
+        # falls through to the cloud path below
 
     try:
         pieces = _segments(text)
@@ -720,10 +752,12 @@ def speak(text, on_first_audio=None):
     player = _play(pieces, on_first_audio=on_first_audio,
                     expected_chars=sum(len(p) for p in pieces))
 
-    if player is None:
+    if player is None and not TTS_LOCAL_FIRST:
         # `player` only stays None when zero chunks of audio ever arrived --
         # _play() isn't reached with empty pieces (checked above), so this
         # means every request failed, not that there was nothing to say.
+        # (Skipped when TTS_LOCAL_FIRST already tried local above -- no
+        # point bouncing back to a tier that just failed.)
         print("tts: cloud speech unavailable, falling back to local voice")
         player = tts_local.speak(text, on_first_audio=on_first_audio)
 
@@ -743,11 +777,30 @@ def speak_stream(pieces, on_first_audio=None, expected_chars=None):
     as speak() -- see _consuming() for how the already-generated text
     survives that handoff even though `pieces` itself can only be drained
     once.
+
+    TTS_LOCAL_FIRST changes this path more than it changes speak(): Kokoro
+    (tts_local.speak()) takes complete text, not a live stream, so
+    local-first here means draining `pieces` fully before speaking a word
+    -- you lose the "starts on the first sentence" benefit this function
+    exists for, in exchange for not touching the cloud unless local fails.
+    Worth knowing before flipping it on for a chat-streamed reply.
     """
     if pieces is None:
         return None
 
     wrapped, captured = _consuming(pieces)
+
+    if TTS_LOCAL_FIRST:
+        text = " ".join(str(p) for p in wrapped if p)
+        if not text.strip():
+            return None
+        player = tts_local.speak(text, on_first_audio=on_first_audio)
+        if player is not None:
+            return player
+        print("tts: local speech unavailable, falling back to cloud voice")
+        return _play(iter([text]), on_first_audio=on_first_audio,
+                      expected_chars=len(text))
+
     player = _play(wrapped, on_first_audio=on_first_audio,
                     expected_chars=expected_chars)
 
