@@ -25,7 +25,7 @@ from listener import ui
 SILENCE_HANGOVER = 0.7
 GRACE_PERIOD = 3          # ignore silence in the opening moments
 MIN_SPEECH_SECONDS = 0.25    # don't endpoint on a click or a door slam
-MAX_RECORD_SECONDS = 15
+MAX_RECORD_SECONDS = 60
 
 # --- Adaptive gating -------------------------------------------------------
 # A fixed RMS threshold breaks both ways: in a noisy room it never endpoints,
