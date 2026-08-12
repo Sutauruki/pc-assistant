@@ -2,3 +2,4 @@ openwakeword
 sounddevice
 numpy
 python-dotenv
+piper-tts

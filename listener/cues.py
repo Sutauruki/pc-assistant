@@ -64,7 +64,22 @@ DONE_NOTES = (
 # finished. stream.write() returns once the data is *buffered*, not once it
 # has been heard, so the device still has up to OUTPUT_LATENCY of audio in
 # hand. Without this the ready cue is still sounding when the mic opens.
-SETTLE_SECONDS = audio_out.OUTPUT_LATENCY + 0.02
+#
+# Deliberately NOT a module-level constant anymore. audio_out.py imports
+# this module (`from listener import ui` pulls in ui.py, which imports
+# cues.py, which imports audio_out.py) *before* audio_out.py finishes
+# defining OUTPUT_LATENCY further down its own file -- so reading it here at
+# import time only worked when something else happened to import ui.py (or
+# cues.py) before it imported audio_out.py directly. Whichever module a
+# process imports *first* decides whether that accident holds -- main.py's
+# import order happened to keep it true, but `python -m listener.tts_local`
+# imports audio_out.py first and broke it: "partially initialized module
+# 'listener.audio_out' has no attribute 'OUTPUT_LATENCY'". Reading the value
+# lazily, at call time instead of import time, means audio_out.py has always
+# finished loading by the time anyone asks -- correct regardless of which
+# module happens to be the process's entry point.
+def _settle_seconds():
+    return audio_out.OUTPUT_LATENCY + 0.02
 
 _cache = {}
 _lock = threading.Lock()
@@ -160,9 +175,10 @@ def _play(name, notes, wait):
         samples, rate = _samples(name, notes)
         audio_out.play_blocking(samples, rate)
         seconds = len(samples) / float(rate)
+        settle = _settle_seconds()
         if wait:
-            time.sleep(seconds + SETTLE_SECONDS)
-        return seconds + SETTLE_SECONDS
+            time.sleep(seconds + settle)
+        return seconds + settle
     except Exception as e:
         print("cue failed ({}) -- continuing without it".format(e))
         return 0.0

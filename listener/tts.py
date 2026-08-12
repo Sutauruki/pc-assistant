@@ -63,6 +63,15 @@ commands/chat.py has its own splitter for streaming answers out sentence by
 sentence. This one is deliberately not shared: listener/ importing from
 commands/ inverts the layering, and thirty duplicated lines is a cheaper price
 than that.
+
+LOCAL FALLBACK
+--------------
+If the Groq path produces zero audio for a reply -- bad key, no terms
+acceptance, rate limited, offline -- speak() and speak_stream() now hand the
+text to listener/tts_local.py (Kitten TTS, fully offline) instead of going
+silent. This is the same STT-side pattern stt_local.py/main.py already use
+for Gemini: a cloud tier failing should cost quality, not the reply
+entirely. See tts_local.py's docstring for why Kitten specifically.
 """
 
 import os
@@ -76,6 +85,7 @@ from dotenv import load_dotenv
 from groq import Groq
 
 from listener.audio_out import StreamingPlayer
+from listener import tts_local
 
 load_dotenv()
 
@@ -656,6 +666,27 @@ def _play(pieces, on_first_audio=None, expected_chars=None):
 
 # --- Public API -----------------------------------------------------------
 
+def _consuming(pieces):
+    """Wraps an iterable of text pieces, capturing everything drawn from it
+    as it's consumed.
+
+    speak_stream()'s `pieces` is often a live, one-shot iterator (a
+    SentenceFeeder draining as commands/chat.py generates text) rather than a
+    list -- by the time _play() finishes there is no going back to replay it.
+    If the Groq path turns out to have produced zero audio, this is what lets
+    the local fallback speak whatever text actually came through instead of
+    nothing.
+    """
+    captured = []
+
+    def gen():
+        for piece in pieces:
+            captured.append(piece)
+            yield piece
+
+    return gen(), captured
+
+
 def speak(text, on_first_audio=None):
     """Streams Groq TTS straight to the speakers -- nothing touches disk.
 
@@ -665,8 +696,9 @@ def speak(text, on_first_audio=None):
 
     on_first_audio: called when the first sample actually hits the device.
 
-    Never raises. A speech failure shouldn't take down the assistant loop --
-    the actions still ran, so it degrades to silent-but-working.
+    Never raises. If Groq produces no audio at all for this reply (offline,
+    rate limited, bad key, terms not accepted), falls back to
+    listener/tts_local.py (Kitten TTS, offline) rather than going silent.
     """
     if not text or not text.strip():
         return None
@@ -685,8 +717,17 @@ def speak(text, on_first_audio=None):
     if len(pieces) > 1:
         print("tts: {} chars -> {} segments".format(len(text), len(pieces)))
 
-    return _play(pieces, on_first_audio=on_first_audio,
-                 expected_chars=sum(len(p) for p in pieces))
+    player = _play(pieces, on_first_audio=on_first_audio,
+                    expected_chars=sum(len(p) for p in pieces))
+
+    if player is None:
+        # `player` only stays None when zero chunks of audio ever arrived --
+        # _play() isn't reached with empty pieces (checked above), so this
+        # means every request failed, not that there was nothing to say.
+        print("tts: cloud speech unavailable, falling back to local voice")
+        player = tts_local.speak(text, on_first_audio=on_first_audio)
+
+    return player
 
 
 def speak_stream(pieces, on_first_audio=None, expected_chars=None):
@@ -698,12 +739,24 @@ def speak_stream(pieces, on_first_audio=None, expected_chars=None):
     seconds off a conversational reply.
 
     The caller decides when the answer is over by ending the iterator.
-    Never raises.
+    Never raises. Falls back to the local voice on total Groq failure, same
+    as speak() -- see _consuming() for how the already-generated text
+    survives that handoff even though `pieces` itself can only be drained
+    once.
     """
     if pieces is None:
         return None
-    return _play(pieces, on_first_audio=on_first_audio,
-                 expected_chars=expected_chars)
+
+    wrapped, captured = _consuming(pieces)
+    player = _play(wrapped, on_first_audio=on_first_audio,
+                    expected_chars=expected_chars)
+
+    if player is None and captured:
+        text = " ".join(str(p) for p in captured if p)
+        print("tts: cloud speech unavailable, falling back to local voice")
+        player = tts_local.speak(text, on_first_audio=on_first_audio)
+
+    return player
 
 
 def speak_async(text, on_first_audio=None):

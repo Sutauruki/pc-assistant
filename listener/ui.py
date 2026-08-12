@@ -25,10 +25,14 @@ the sound card, so it cannot be allowed to block. It takes its own small lock
 rather than the render lock, which is held across the console write. See the
 note in Dashboard.__init__.
 
-NEW: THE PROMPT ROW
--------------------
-set_input() draws the line you are currently typing *inside* the panel, and
+THE PROMPT ROW(S)
+------------------
+set_input() draws whatever you are currently typing *inside* the panel, and
 listener/console_input.py reads keystrokes without the console echoing them.
+Shift+Enter (Windows only -- see console_input.py) can put more than one
+line in there; _input_rows() draws one panel row per line, which the
+existing variable-height redraw in _draw_locked() already handles without
+changes -- it was never assuming a fixed row count to begin with.
 Letting the terminal echo normally does not work here: the cursor parks on the
 row below the panel, so a pressed Enter scrolls the screen by one line while
 the panel's own `\x1b[{n}A` arithmetic still thinks it is n rows up. The panel
@@ -86,7 +90,7 @@ THINK_AMPLITUDE = 0.22
 MAX_DELAY_FRAMES = FPS  # one second
 
 # Caret blink period, in frames per phase. Only blinks while there is text in
-# the buffer -- see the note in _input_row.
+# the buffer -- see the note in _active_input_row.
 CARET_FRAMES = FPS // 2
 
 # RMS -> 0..1 mapping, in dBFS. Speech sits around -30dB, so a linear
@@ -658,7 +662,7 @@ class Dashboard(object):
 
         # --- prompt
         if self._input_enabled:
-            rows.append(self._input_row(inner, accent))
+            rows.extend(self._input_rows(inner, accent))
 
         rows.append(
             border + box["bl"] + box["h"] * (inner + 2) + box["br"] + reset
@@ -734,12 +738,46 @@ class Dashboard(object):
         )
         return self._pad_row(painted, len(plain), inner, _fg(BORDER_RGB))
 
-    def _input_row(self, inner, accent):
-        """The line being typed, truncated from the *left*.
+    def _input_rows(self, inner, accent):
+        """The line(s) being typed -- one row per line now that Shift+Enter
+        (console_input.py) can put "\\n" in the buffer.
 
-        Opposite of _text_row, and deliberately: on a transcript you want the
-        beginning, on a line you are still typing you want the end -- the
-        cursor has to stay on screen or you're typing blind.
+        Only the last line has a cursor on it in any meaningful sense (the
+        buffer is append-only; there's no mid-buffer cursor to track), so
+        only it keeps the original _input_row behaviour: the prompt glyph,
+        the blinking caret, truncated from the *left* so the cursor stays
+        on screen while you're still typing it. Finished lines above it are
+        just text now -- rendered with _text_row's own left-to-right
+        truncation, same as the heard/reply rows, since there's nothing
+        moving on them to keep in view.
+
+        A panel that ends up taller than the terminal already returns None
+        from _frame_locked and skips the draw rather than corrupting the
+        cursor-up arithmetic -- see the check at the end of that method --
+        so an unusually long paste here degrades to "panel doesn't draw
+        this frame" rather than anything worse.
+        """
+        box = self._box
+        text = self._input
+
+        if not text:
+            return [self._text_row(
+                box["typed"], self._input_hint, inner, DIM_RGB, DIM_RGB
+            )]
+
+        lines = text.split("\n")
+        rows = [
+            self._text_row(box["sep"], line, inner, DIM_RGB, TEXT_RGB)
+            for line in lines[:-1]
+        ]
+        rows.append(self._active_input_row(lines[-1], inner, accent))
+        return rows
+
+    def _active_input_row(self, text, inner, accent):
+        """One row for the line the cursor is actually on -- the caret, the
+        prompt glyph, truncated from the left. Body unchanged from the old
+        single-line _input_row; it just takes its text explicitly now that
+        self._input can hold more than this one row's worth.
 
         The caret only blinks while there is text. A caret that blinks forever
         changes the frame twice a second, and _draw_locked skips the console
@@ -748,13 +786,6 @@ class Dashboard(object):
         a machine this project is trying to be gentle to.
         """
         box = self._box
-        text = self._input
-
-        if not text:
-            return self._text_row(
-                box["typed"], self._input_hint, inner, DIM_RGB, DIM_RGB
-            )
-
         caret = box["caret"] if (self._tick // CARET_FRAMES) % 2 == 0 else " "
 
         # glyph + space + caret
