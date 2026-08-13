@@ -113,6 +113,7 @@ _CTRL_C = "\x03"
 _CTRL_D = "\x04"
 _CTRL_J = "\x0a"  # Ctrl+J / linefeed -- the cross-terminal newline shortcut,
                   # see "SHIFT+ENTER, AND WHY CTRL+J IS HERE TOO" above.
+_CTRL_L = "\x0c"  # Ctrl+L -- toggles the history overlay (listener/ui.py).
 _CTRL_U = "\x15"
 _CTRL_W = "\x17"
 _BACKSPACE = ("\x08", "\x7f")
@@ -121,6 +122,11 @@ _BACKSPACE = ("\x08", "\x7f")
 # means an actual Ctrl+J and gets its own branch in _handle() below.
 _ENTER = ("\r",)
 _ESCAPE = "\x1b"
+# Arrow / navigation virtual keys used to scroll the history overlay.
+_VK_UP = 0x26
+_VK_DOWN = 0x28
+_VK_PAGEUP = 0x21
+_VK_PAGEDOWN = 0x22
 
 _queue = queue.Queue()
 _stop = threading.Event()
@@ -205,6 +211,10 @@ def _handle(char):
         _insert_newline()
         return True
 
+    if char == _CTRL_L:
+        ui.toggle_history()
+        return True
+
     if char in _BACKSPACE:
         _backspace()
         return True
@@ -231,7 +241,12 @@ def _handle(char):
         return True
 
     if char == _ESCAPE:
-        _clear()
+        # Esc first closes the history overlay if it's open, so the muscle
+        # memory of "Esc gets back to the normal view" works there too.
+        if ui.history_active():
+            ui.toggle_history()
+        else:
+            _clear()
         return True
 
     # Anything else in the control range is not text -- tabs, bells, stray
@@ -250,6 +265,7 @@ def _handle(char):
 
 _VK_RETURN = 0x0D
 _VK_J = 0x4A
+_VK_L = 0x4C
 _SHIFT_PRESSED = 0x0010  # dwControlKeyState bit; ignores caps/num lock etc.
 _LEFT_CTRL_PRESSED = 0x0008
 _RIGHT_CTRL_PRESSED = 0x0004
@@ -355,12 +371,32 @@ def _read_windows():
             _insert_newline()
             continue
 
+        # Third pattern of the same kind as the Ctrl+J one above: Ctrl+L
+        # toggles the history overlay. Checked by virtual key + modifier so
+        # it survives the same ConPTY modifier-drop that Shift+Enter hits.
+        if (key.wVirtualKeyCode == _VK_L
+                and key.dwControlKeyState & _CTRL_PRESSED):
+            ui.toggle_history()
+            continue
+
         char = key.UnicodeChar
         if not char or char == "\x00":
             # A function/navigation/modifier key with no character of its
             # own -- arrows, Home/End, F-keys. The old reader needed a
             # second read to consume these; a raw key event already carries
-            # everything in one, so there's nothing left to do but skip it.
+            # everything in one, so there's nothing left to do but skip
+            # them -- unless the history overlay is up, in which case the
+            # navigation keys scroll it.
+            if ui.history_active():
+                vk = key.wVirtualKeyCode
+                if vk == _VK_UP:
+                    ui.history_scroll(-1)
+                elif vk == _VK_DOWN:
+                    ui.history_scroll(1)
+                elif vk == _VK_PAGEUP:
+                    ui.history_scroll(-10)
+                elif vk == _VK_PAGEDOWN:
+                    ui.history_scroll(10)
             continue
 
         if not _handle(char):
@@ -390,6 +426,14 @@ def _read_posix():
     import termios
     import tty
 
+    def _seq(timeout=0.05):
+        """One more byte, or None if nothing arrives within `timeout`. Lets
+        an escape sequence be read without blocking forever on a lone Esc."""
+        r, _, _ = select.select([fd], [], [], timeout)
+        if not r:
+            return None
+        return os.read(fd, 1).decode("utf-8", "ignore")
+
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     try:
@@ -404,6 +448,31 @@ def _read_posix():
             char = os.read(fd, 1).decode("utf-8", "ignore")
             if not char:
                 continue
+
+            if char == _CTRL_L:
+                ui.toggle_history()
+                continue
+
+            if char == _ESCAPE:
+                # Escape sequences: arrows come as ESC [ A/B, PageUp/Down as
+                # ESC [ 5~/6~. A lone Esc (no continuation in time) falls
+                # through to the normal single-char handler.
+                nxt = _seq()
+                if nxt == "[":
+                    third = _seq() or ""
+                    if third in "ABCD":
+                        if ui.history_active():
+                            ui.history_scroll(-1 if third == "A" else 1)
+                    elif third in "56":
+                        _seq()  # consume the trailing '~'
+                        if ui.history_active():
+                            ui.history_scroll(-10 if third == "5" else 10)
+                    continue
+                if nxt is not None:
+                    continue  # a multi-byte key we don't act on; drop the rest
+                _handle(_ESCAPE)  # a bare Escape key
+                continue
+
             if not _handle(char):
                 return
     finally:

@@ -3,8 +3,12 @@
 Goes in: listener/ui.py   (replaces existing)
 
 Draws a fixed panel at the bottom of the terminal -- state, waveform, what was
-heard, what Jarvis said, and a prompt line you can type into -- while ordinary
-log output keeps scrolling above it.
+heard, what Jarvis said, and a prompt line you can type into. Log lines no
+longer scroll above this panel (which used to shove it down the screen and
+shred its borders); instead they are buffered into a history and shown as a
+dim toast for a few seconds before the panel settles back to just the
+conversation. The whole history is available on demand with Ctrl+L (see
+toggle_history(), and Ctrl+L/arrows in listener/console_input.py).
 
 The waveform is driven from two places:
 
@@ -125,6 +129,14 @@ STATS_RGB = (93, 202, 165)
 # shows at the ring's right. Same idea as the mockup's fixed "▁▂▁▃▂" row but
 # live -- it scrolls with whatever the mic/speaker actually produced.
 SPARK_WIDTH = 24
+
+# How long the most recent log line stays visible as a dim toast inside the
+# panel before it settles back to just the conversation. The panel itself
+# never moves -- this is purely an overlay that clears on its own.
+TOAST_SECONDS = 4.0
+
+# Cap on buffered log lines kept for the history overlay (ctrl+L).
+HISTORY_MAX = 200
 
 _SPINNER = "◐◓◑◒"
 _SPINNER_ASCII = "|/-\\"
@@ -314,6 +326,16 @@ class Dashboard(object):
         self._turns = 0
         self._t0 = None
         self._spark = deque(maxlen=SPARK_WIDTH)
+
+        # Log handling. Log lines no longer print above the panel and shove
+        # it down the screen; they are buffered into _history and shown as a
+        # transient toast that clears on its own, with a full-history overlay
+        # available on demand (see toggle_history / history_scroll).
+        self._history = deque(maxlen=HISTORY_MAX)
+        self._toast = None
+        self._toast_until = 0
+        self._history_on = False
+        self._history_scroll = 0
 
         # Prompt row. Off until console_input says it has a reader running --
         # showing a prompt you cannot type into would be a lie.
@@ -529,6 +551,42 @@ class Dashboard(object):
         with self._lock:
             self._turns = int(count or 0)
 
+    # --- history overlay ---------------------------------------------------
+
+    def toggle_history(self):
+        """Toggles the full-log overlay (the history of everything that
+        would once have scrolled above the panel). On entry the view is
+        reset to the newest lines."""
+        with self._lock:
+            self._history_on = not self._history_on
+            if self._history_on:
+                self._history_scroll = 0
+            self._last_frame = None
+
+    def history_active(self):
+        return self._history_on
+
+    def history_room(self):
+        """Rows available for the history list, roughly. Used to clamp the
+        scroll offset; the render itself lets the existing too-tall check
+        bail out rather than corrupting the cursor arithmetic."""
+        return max(1, self._terminal_size()[1] - 5)
+
+    def history_scroll(self, delta):
+        """Scrolls the history overlay by `delta` (negative = up/older).
+        Returns True if the overlay is still up, so the key reader knows
+        whether to keep swallowing navigation keys."""
+        with self._lock:
+            if not self._history_on:
+                return False
+            count = len(self._history)
+            top = max(0, count - self.history_room())
+            self._history_scroll = max(
+                0, min(top, self._history_scroll + int(delta))
+            )
+            self._last_frame = None
+            return True
+
     def enable_input(self, enabled=True, hint=None):
         """Shows or hides the prompt row. console_input calls this once it
         knows it actually has a keystroke reader."""
@@ -546,21 +604,27 @@ class Dashboard(object):
             self._input = text or ""
 
     def log(self, line):
-        """Prints above the panel."""
+        """A log line. Kept out of the way instead of printing above the
+        panel and shoving it down the screen (the old behaviour, which is
+        what made the dashboard wander and shred).
+
+        When the panel is live, the line goes into the history buffer and
+        shows as a dim toast for TOAST_SECONDS, then settles back. The
+        full history is available on demand -- see toggle_history(). When
+        the UI isn't running (piped, JARVIS_NO_UI) there's no panel to
+        protect, so it prints normally as plain stdout.
+        """
         with self._lock:
             if not self._active:
                 self._write(line + "\n")
                 return
 
-            out = []
-            if self._lines_drawn:
-                out.append("\x1b[{}A".format(self._lines_drawn))
-            out.append("\x1b[J")            # wipe panel and everything below
-            out.append(line + "\n")
-            self._lines_drawn = 0
-            self._last_frame = None         # force a full repaint
-            self._write("".join(out))
-            self._draw_locked()
+            self._history.append(line)
+            # Each new line refreshes the window, so a burst of diagnostics
+            # reads as one continuous status line rather than a flashing row.
+            self._toast = line
+            self._toast_until = self._tick + int(TOAST_SECONDS * FPS)
+            self._last_frame = None
 
     # --- rendering ---------------------------------------------------------
 
@@ -616,6 +680,11 @@ class Dashboard(object):
         self._last_level = level
         self._spark.append(level)
         self._spin = (self._spin + 1) % (len(self._spinner) * 4)
+
+        # Let a stale toast fade back to just the conversation.
+        if self._toast is not None and self._tick >= self._toast_until:
+            self._toast = None
+            self._last_frame = None
 
     def _ring_cols(self):
         """Ring width in terminal columns, scaled with the panel like the
@@ -704,6 +773,12 @@ class Dashboard(object):
         border = _fg(BORDER_RGB)
         reset = "\x1b[0m"
 
+        if self._history_on:
+            rows = self._history_rows(box, inner, border, reset, accent)
+            if len(rows) + 2 > self._terminal_size()[1]:
+                return None
+            return "\n".join(rows)
+
         rows = []
 
         # --- header: ╭─ JARVIS ────────── ● SPEAKING ─╮
@@ -742,6 +817,14 @@ class Dashboard(object):
             border + box["ml"] + box["h"] * (inner + 2) + box["mr"] + reset
         )
 
+        # --- transient toast: the most recent log line, which clears on its
+        # own after TOAST_SECONDS (see _advance_locked). Dim so it never
+        # competes with the actual conversation below it.
+        if self._toast is not None:
+            rows.append(self._text_row(
+                box["sep"], self._toast, inner, DIM_RGB, DIM_RGB
+            ))
+
         # --- transcript / reply / timing
         rows.append(self._text_row(
             box["prompt"], self._heard or "waiting for \"hey jarvis\"",
@@ -771,6 +854,44 @@ class Dashboard(object):
             return None
 
         return "\n".join(rows)
+
+    def _history_rows(self, box, inner, border, reset, accent):
+        """The full-log overlay: every line that would once have scrolled
+        above the panel, shown in place of the ring and conversation so it
+        has the whole panel to itself. Opens with ctrl+L, closes the same
+        way (or with Esc); ↑/↓/PageUp/PageDown scroll a window scrolled by
+        history_scroll()."""
+        title = "J A R V I S"
+        status = "  H I S T O R Y  "
+        fill = max(1, (inner + 4) - 8 - len(title) - len(status))
+        rows = [
+            border + box["tl"] + box["h"] + " " + reset
+            + _fg(TEXT_RGB) + title + reset
+            + " " + border + box["h"] * fill + " " + reset
+            + _fg(accent) + status + reset
+            + border + " " + box["h"] + box["tr"] + reset,
+            self._text_row(
+                box["sep"],
+                "ctrl+L close · ↑/↓ or PageUp/PageDown scroll",
+                inner, DIM_RGB, DIM_RGB,
+            ),
+            border + box["ml"] + box["h"] * (inner + 2) + box["mr"] + reset,
+        ]
+
+        lines = list(self._history)
+        count = len(lines)
+        room = self.history_room()
+        start = max(0, count - max(1, room) - self._history_scroll)
+        for ln in lines[start:]:
+            rows.append(self._text_row(box["sep"], ln, inner, DIM_RGB, TEXT_RGB))
+
+        if self._input_enabled:
+            rows.extend(self._input_rows(inner, accent))
+
+        rows.append(
+            border + box["bl"] + box["h"] * (inner + 2) + box["br"] + reset
+        )
+        return rows
 
     def _ring_params(self):
         """Current (t, speed, amp, buzz) for the wobble formula below.
@@ -1077,6 +1198,18 @@ def set_turns(count):
     _dashboard.set_turns(count)
 
 
+def toggle_history():
+    _dashboard.toggle_history()
+
+
+def history_active():
+    return _dashboard.history_active()
+
+
+def history_scroll(delta):
+    return _dashboard.history_scroll(delta)
+
+
 def enable_input(enabled=True, hint=None):
     _dashboard.enable_input(enabled, hint=hint)
 
@@ -1096,12 +1229,17 @@ def is_active():
 
 
 if __name__ == "__main__":
-    # Fake a turn so the panel can be eyeballed without the mic or the API.
+    # Walk the whole API so the panel can be eyeballed without the mic or
+    # the API: every state, the toast behaviour for log lines, the history
+    # overlay (auto-played, then left open for you to scroll), and a live
+    # prompt driven by the real keystroke reader.
     import random
 
     if not start():
         print("dashboard inactive -- not a terminal, or JARVIS_NO_UI is set")
         raise SystemExit(1)
+
+    ci = None
 
     try:
         enable_input(True)
@@ -1109,6 +1247,7 @@ if __name__ == "__main__":
         set_engine("gemini", "groq · cloud")
         set_turns(14)
         set_latency("1.4s")
+        log("demo: JARVIS UI preview -- Ctrl+L = history, Ctrl+C = quit")
         for _ in range(int(FPS * 1.5)):
             push_level(random.uniform(0.0, 0.06))
             time.sleep(1.0 / FPS)
@@ -1132,6 +1271,8 @@ if __name__ == "__main__":
 
         set_reply("Sure, opening Spotify and grabbing that screenshot.")
         set_state(SPEAKING)
+        # These prints are captured by the dashboard's stdout proxy and show
+        # up as the dim, self-clearing toast -- not as scrollback.
         print("Opened Spotify")
         print("Screenshot taken")
         for i in range(int(FPS * 3)):
@@ -1144,8 +1285,60 @@ if __name__ == "__main__":
 
         set_state(LISTENING)
         set_timing("stt 1.10s | reply 0.42s | first audio 0.09s")
-        time.sleep(2.0)
+        time.sleep(1.2)
+
+        # Give the history overlay something to browse.
+        for _ in range(5):
+            log("demo: a thing Jarvis did (e.g. opened an app, grabbed output)")
+        log("demo: history now has lines for you to scroll through")
+        time.sleep(1.5)
+
+        # Auto-play the overlay so you can see it open, scroll and close.
+        log("demo: opening history overlay...")
+        time.sleep(1.0)
+        toggle_history()
+        time.sleep(1.2)
+        history_scroll(-2)   # a page up
+        time.sleep(1.2)
+        history_scroll(8)    # back toward the newest
+        time.sleep(1.2)
+        toggle_history()
+        log("demo: overlay closed -- back to the panel")
+        time.sleep(1.0)
+
+        # Hand over to the real keystroke reader so you can drive it: type to
+        # see the prompt, Ctrl+L for history, Ctrl+C to quit.
+        try:
+            import listener.console_input as ci
+        except Exception:
+            ci = None
+        if ci is not None and ci.start():
+            set_input("")
+            set_state(LISTENING)
+            log("demo: live now -- type anything, Ctrl+L = history, Ctrl+C = quit")
+            end = None  # interactive until Ctrl+C
+        else:
+            ci = None
+            log("demo: no key reader here -- will end in 5s (Ctrl+C sooner)")
+            end = time.time() + 5.0
+
+        while True:
+            if ci is not None:
+                line = ci.poll()
+                if line:
+                    set_heard(line)
+                    set_reply('(demo) echoed "{}"'.format(line))
+                    log("demo: submitted: {}".format(line))
+            push_level(random.uniform(0.0, 0.04))
+            if end is not None and time.time() >= end:
+                break
+            time.sleep(1.0 / FPS)
     except KeyboardInterrupt:
         pass
     finally:
+        if ci is not None:
+            try:
+                ci.stop()
+            except Exception:
+                pass
         stop()

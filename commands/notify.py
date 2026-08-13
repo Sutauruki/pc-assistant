@@ -27,6 +27,11 @@ notification would be slower than the notification.
 
     pip install win11toast        <- the one I'd recommend
 
+confirm() builds on win11toast specifically -- it is the only backend that can
+hand a button click or typed answer back to the process (see "Interactive
+confirm" below). Everywhere else it degrades to a static toast that points the
+user at the terminal, where the confirmation stays answerable the normal way.
+
 WHY IT NEVER RUNS ON THE CALLING THREAD
 ---------------------------------------
 Every backend here either blocks for the toast duration or talks to WinRT,
@@ -35,6 +40,7 @@ the wake loop, so the actual show happens on a short-lived daemon thread and
 the caller gets its result string immediately.
 """
 
+import asyncio
 import os
 import subprocess
 import threading
@@ -260,6 +266,105 @@ def notify(title, message=None, duration=DEFAULT_DURATION, blocking=False):
 
     threading.Thread(target=run, daemon=True).start()
     return "Notification sent"
+
+
+# --- Interactive confirm ---------------------------------------------------
+#
+# A confirmation toast with quick-reply controls, WhatsApp style: [Yes]/[No]
+# buttons plus a text box you can type a full answer into. Only one backend
+# (win11toast) can hand an answer back in-process, so anything else falls back
+# to a plain long toast that points the user at the terminal/voice -- where
+# the confirmation is still pending and answerable the normal way. The win11
+# path registers a background activation handler that runs on_answered(text)
+# on a background thread when the toast is answered.
+
+_INTERACTIVE_APP_ID = "Jarvis.Confirmation"
+
+
+def confirm(title, question, on_answered):
+    """Shows an answerable confirmation notification.
+
+    question:   the full question, e.g. "Should I permanently delete Downloads/
+                temp.txt?"
+    on_answered: called with the answer text (a button click or whatever was
+                 typed into the toast) on a background thread. May be called
+                 more than once if a self-similar toast is answered twice.
+
+    Returns a result string. Non-blocking either way.
+    """
+    if _interactive_confirm(title, question, on_answered):
+        return "Confirmation shown"
+
+    notify(
+        title,
+        question + "  (reply by typing in the terminal, or say your answer.)",
+        duration="long",
+    )
+    return "Confirmation shown"
+
+
+def _interactive_confirm(title, question, on_answered):
+    """Returns True if an interactive toast is on screen and will deliver the
+    answer. False means there's no backend that can -- caller shows a static
+    toast instead."""
+    try:
+        import win11toast  # noqa: PLC0415 - probed lazily on purpose
+    except ImportError:
+        return False
+    if not _can_encode(question):
+        return False
+
+    def runner():
+        try:
+            _win11toast_driver(title, question, on_answered)
+        except Exception as e:
+            print("notify.confirm: interactive toast failed ({})".format(e))
+
+    threading.Thread(target=runner, daemon=True).start()
+    return True
+
+
+def _win11toast_driver(title, question, on_answered):
+    """win11toast's toast() is a coroutine that waits on activation, so it gets
+    its own event loop on the worker thread. The click callback fires on that
+    loop; we forward straight to on_answered."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_win11toast_ask(title, question, on_answered))
+    finally:
+        loop.close()
+
+
+async def _win11toast_ask(title, question, on_answered):
+    import win11toast  # noqa: PLC0415
+
+    def on_click(args):
+        # Prefer free text from the input box; buttons fall back to the label.
+        user = args.get("user_input") or {}
+        raw = ""
+        for value in user.values():
+            if value:
+                raw = str(value).strip()
+                break
+        if not raw:
+            argument = args.get("arguments", "").lower()
+            if "yes" in argument:
+                raw = "yes"
+            elif "no" in argument or "cancel" in argument:
+                raw = "no"
+        if raw:
+            on_answered(raw)
+
+    await win11toast.toast(
+        title,
+        question,
+        on_click=on_click,
+        input="reply",
+        buttons=["Yes", "No"],
+        duration="long",
+        app_id=_INTERACTIVE_APP_ID,
+    )
 
 
 def available():

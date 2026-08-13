@@ -41,6 +41,7 @@ from commands import file_actions
 from commands import locate
 from commands import memory
 from commands import notify as notifications
+from commands import screen_actions
 from commands import window_actions
 
 SCREENSHOTS_DIR = "screenshots"
@@ -240,6 +241,13 @@ def _run_one(action):
             _first(action, "message", "body", "text"),
         )
 
+    # --- screen -------------------------------------------------------------
+    if kind == "understand_screen":
+        return _call(
+            screen_actions.understand_screen,
+            _first(action, "question", "query", "text"),
+        )
+
     # --- memory -------------------------------------------------------------
     if kind in ("set_preference", "remember_preference", "save_preference"):
         return _call(
@@ -289,6 +297,8 @@ def execute_actions(actions):
     the whole loop, so the successful Notepad close was discarded along with
     it and the turn went by in silence.
     """
+    from commands import devlog  # local import: this is hot enough to be lazy
+
     results = []
     for action in actions:
         # Read the kind up front. Doing it inside the except block means a
@@ -300,10 +310,15 @@ def execute_actions(actions):
         except AttributeError:
             kind = None
 
+        t0 = time.time()
         try:
             results.append(_run_one(action))
+            devlog.exec_event(kind or "unknown", "run", "OK",
+                              seconds=time.time() - t0)
         except Exception as e:
             msg = "Failed to {}: {}".format(kind or "run that", e)
+            devlog.exec_event(kind or "unknown", "run", "FAIL",
+                              str(e)[:120], seconds=time.time() - t0)
             print(msg)
             results.append(msg)
 

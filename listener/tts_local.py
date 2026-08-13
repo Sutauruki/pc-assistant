@@ -132,7 +132,6 @@ def speak(text, on_first_audio=None):
             if player is None:
                 player = StreamingPlayer(
                     samplerate=SAMPLE_RATE,
-                    speed=1.0,
                     on_first_audio=on_first_audio,
                 )
                 player.start()

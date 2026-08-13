@@ -11,5 +11,6 @@ venv
 *.zip
 cache
 *.md
+!README.md
 *.onnx
 *.onnx.json

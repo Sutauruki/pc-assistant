@@ -39,7 +39,7 @@ AND WHY THERE IS A PREFETCH THREAD
 ----------------------------------
 Segments are synthesised one after another, so while request N+1 is in flight
 nothing is arriving: no bytes for the length of a round trip, typically
-300-700ms. The player is draining at SPEECH_SPEED the whole time. On a
+300-700ms. The player is draining in real time the whole time. On a
 four-segment answer that is four hard stalls, each one long enough to hear --
 the structural version of the same fault, reintroduced by the fix for the
 truncation.
@@ -68,10 +68,10 @@ LOCAL FALLBACK
 --------------
 If the Groq path produces zero audio for a reply -- bad key, no terms
 acceptance, rate limited, offline -- speak() and speak_stream() now hand the
-text to listener/tts_local.py (Kitten TTS, fully offline) instead of going
-silent. This is the same STT-side pattern stt_local.py/main.py already use
-for Gemini: a cloud tier failing should cost quality, not the reply
-entirely. See tts_local.py's docstring for why Kitten specifically.
+text to the local voices (tts_moonshine.py; if that is unavailable,
+tts_local.py, fully offline) instead of going silent. This is the same
+STT-side pattern stt_local.py/main.py already use for Gemini: a cloud tier
+failing should cost quality, not the reply entirely.
 """
 
 import os
@@ -79,15 +79,28 @@ import queue
 import re
 import struct
 import threading
-
+import time
 import numpy as np
 from dotenv import load_dotenv
 from groq import Groq
 
 from listener.audio_out import StreamingPlayer
 from listener import tts_local
+from listener import tts_moonshine
 
 load_dotenv()
+
+# Dev log -- dev-logging-only inversion of the listener/commands layering,
+# pulled in lazily so production runs never import commands from here.
+_devlog = None
+
+
+def _dl():
+    global _devlog
+    if _devlog is None:
+        from commands import devlog
+        _devlog = devlog
+    return _devlog
 
 MODEL_NAME = "canopylabs/orpheus-v1-english"
 
@@ -99,65 +112,22 @@ VOICE_NAME = "autumn"
 
 RESPONSE_FORMAT = "wav"
 
-# Playback rate, applied locally in audio_out via pitch-preserving WSOLA.
-#
 # The `speed` field in the Groq SDK signature is a no-op for Orpheus -- the
-# model accepts it and ignores it. Groq's own answer is inline "[fast paced]"
-# tags, but the docs admit the model applies unrecognised directions
-# inconsistently, and a tag that sometimes works is not much use on every
-# reply. Stretching the samples ourselves is deterministic and costs ~1ms per
-# chunk.
-#
-# 1.25 -> 1.15. This is the single biggest lever on the remaining chop, and
-# it is worth understanding why rather than just taking the number.
-#
-# Groq generates roughly at realtime. Playing at 1.25x drains the buffer at
-# 1.25 played-seconds per wall second against ~1.0 arriving, so the player
-# loses 0.25s of cushion for every second it plays -- a *structural* deficit
-# that no amount of buffering removes, only delays. Over a 4-second reply that
-# is a full second of audio that has to be pre-funded up front or made up
-# somewhere. At 1.15 the deficit is 0.15s/s, 40% smaller, and it lands inside
-# what the player's speed governor can absorb without a pause.
-#
-# audio_out treats this as a *target*, not a promise: when the buffer runs thin
-# it eases the stretch down toward 1.0 and back up again, which is heard as a
-# slight change of pace instead of a gap. So the cost of this number being
-# slightly optimistic is "one sentence reads a little slower", not "the
-# sentence has a hole in it".
-#
-# Past ~1.6 the WSOLA seams get audible on sibilants. Below ~1.05 there is no
-# point stretching at all -- set it to 1.0 and the stretcher is skipped
-# entirely, which is the cheapest and smoothest option if you don't mind the
-# natural pace.
-SPEECH_SPEED = 1.15
-
-# --- Direct vs tweaked audio --------------------------------------------
-# 1 = "direct audio": skip the WSOLA time-stretch above entirely and play
-#     Groq's speech back at its native pace -- the StreamingPlayer never
-#     even builds a TimeStretcher (see its __init__: it only instantiates
-#     one when speed differs from 1.0 by more than 0.01).
-# 0 = "tweaked audio" (default): stretch to SPEECH_SPEED as described
-#     above.
-# Env override: JARVIS_DIRECT_AUDIO=1
-DIRECT_AUDIO = int(os.environ.get("JARVIS_DIRECT_AUDIO", "0"))
-
+# model accepts it and ignores it, so the audio plays at its natural pace and
+# no local time-stretching is applied. audio_out just streams it through.
 # --- Local-first vs cloud-first -----------------------------------------
-# 0 = cloud (Groq/Orpheus) first, falling back to the local Kokoro voice
-#     only if the cloud path produces no audio at all (default -- best
-#     quality when you're online).
-# 1 = local (Kokoro) first, falling back to cloud only if the local model
-#     can't produce audio (e.g. model files missing) -- for working
-#     offline-first, or keeping cloud TTS spend down.
+# 0 = cloud (Groq/Orpheus) first, falling back to local (Moonshine, then
+#     Kokoro-ONNX) only if the cloud path produces no audio at all.
+# 1 = local first: Moonshine TTS (listener/tts_moonshine.py), then
+#     Kokoro-ONNX (listener/tts_local.py), then cloud. Moonshine is the
+#     primary local voice -- the audio it synthesises goes straight to the
+#     speakers with no time-stretch, speed governor, or dry-buffer recovery
+#     in between.
 # Env override: JARVIS_TTS_LOCAL_FIRST=1
 TTS_LOCAL_FIRST = int(os.environ.get("JARVIS_TTS_LOCAL_FIRST", "0"))
 
-# Rough speaking rate of the *source* audio, used only to tell the player how
-# much is coming so it can size its prebuffer and cap its recovery pauses.
-#
-# Erring low is the safe direction: it overstates how much audio is still to
-# come, which makes the prebuffer slightly generous and recovery pauses
-# slightly shorter. Erring high understates the reply and under-buffers it,
-# which is audible. audio_out clamps the result either way.
+# Rough speaking rate of the *source* audio, used only to size the finish()
+# timeout for a long conversational reply -- a fixed timeout would truncate it.
 CHARS_PER_SECOND = 13.0
 
 # Orpheus accepts 8000/16000/22050/24000/32000/44100/48000 and defaults to
@@ -466,8 +436,8 @@ class WavStreamDecoder:
 # --- Requests -------------------------------------------------------------
 
 def _create_kwargs(text):
-    # No `speed` here on purpose -- Orpheus ignores it. Pacing is handled
-    # downstream by the time-stretcher in audio_out.
+    # No `speed` here on purpose -- Orpheus ignores it; audio plays at its
+    # natural pace.
     return {
         "model": MODEL_NAME,
         "voice": VOICE_NAME,
@@ -583,6 +553,7 @@ def _synthesise(pieces, out, stop):
                 if stop.is_set():
                     break
                 decoder = WavStreamDecoder()
+                t0 = time.time()
                 try:
                     for raw in _iter_response_bytes(client, text):
                         if stop.is_set():
@@ -598,6 +569,9 @@ def _synthesise(pieces, out, stop):
                     _explain_failure(e)
                     stop.set()
                     break
+                _dl().tts("orpheus", "synthesise", "OK",
+                          detail="{} chars".format(len(text)),
+                          seconds=time.time() - t0)
     finally:
         out.put(_DONE)
 
@@ -610,7 +584,7 @@ def _finish_timeout(expected_seconds):
     """
     if not expected_seconds:
         return MIN_FINISH_TIMEOUT
-    return max(MIN_FINISH_TIMEOUT, (expected_seconds / SPEECH_SPEED) + 20.0)
+    return max(MIN_FINISH_TIMEOUT, expected_seconds + 20.0)
 
 
 def _play(pieces, on_first_audio=None, expected_chars=None):
@@ -645,12 +619,7 @@ def _play(pieces, on_first_audio=None, expected_chars=None):
                 rate = chunk_rate or SAMPLE_RATE
                 player = StreamingPlayer(
                     samplerate=rate,
-                    speed=(1.0 if DIRECT_AUDIO else SPEECH_SPEED),
                     on_first_audio=on_first_audio,
-                    # Lets the player work out how much to hold back before it
-                    # starts, and how long a mid-reply refill is allowed to
-                    # take, instead of guessing fixed figures.
-                    expected_seconds=expected_seconds,
                 )
                 player.start()
             elif chunk_rate and chunk_rate != rate:
@@ -717,21 +686,36 @@ def speak(text, on_first_audio=None):
     on_first_audio: called when the first sample actually hits the device.
 
     Never raises. If Groq produces no audio at all for this reply (offline,
-    rate limited, bad key, terms not accepted), falls back to
-    listener/tts_local.py (Kitten TTS, offline) rather than going silent.
+    rate limited, bad key, terms not accepted), falls back to the local
+    voices (Moonshine, then Kokoro-ONNX) rather than going silent.
 
     Order is controlled by TTS_LOCAL_FIRST above: cloud-first (default)
-    tries Groq and falls back to local; local-first tries Kokoro and falls
-    back to cloud. Either way, the other tier only gets a turn if the
-    first one produces zero audio.
+    tries Groq and falls back to local; local-first tries Moonshine, then
+    Kokoro, then cloud. Either way, a tier only gets a turn if the one
+    before it produced zero audio.
     """
     if not text or not text.strip():
         return None
 
     if TTS_LOCAL_FIRST:
+        t0 = time.time()
+        player = tts_moonshine.speak(text, on_first_audio=on_first_audio)
+        if player is not None:
+            _dl().tts("moonshine", "speak", "OK",
+                      detail="{} chars".format(len(text)),
+                      seconds=time.time() - t0)
+            return player
+        _dl().tts("moonshine", "speak", "FAIL",
+                  detail="unavailable -> kokoro")
+        print("tts: Moonshine unavailable, trying Kokoro")
+        t0 = time.time()
         player = tts_local.speak(text, on_first_audio=on_first_audio)
         if player is not None:
+            _dl().tts("kokoro", "speak", "OK",
+                      detail="{} chars".format(len(text)),
+                      seconds=time.time() - t0)
             return player
+        _dl().tts("kokoro", "speak", "FAIL", detail="unavailable -> cloud")
         print("tts: local speech unavailable, falling back to cloud voice")
         # falls through to the cloud path below
 
@@ -749,6 +733,7 @@ def speak(text, on_first_audio=None):
     if len(pieces) > 1:
         print("tts: {} chars -> {} segments".format(len(text), len(pieces)))
 
+    t0 = time.time()
     player = _play(pieces, on_first_audio=on_first_audio,
                     expected_chars=sum(len(p) for p in pieces))
 
@@ -758,8 +743,25 @@ def speak(text, on_first_audio=None):
         # means every request failed, not that there was nothing to say.
         # (Skipped when TTS_LOCAL_FIRST already tried local above -- no
         # point bouncing back to a tier that just failed.)
+        _dl().tts("orpheus", "speak", "FAIL", detail="no audio -> local")
         print("tts: cloud speech unavailable, falling back to local voice")
-        player = tts_local.speak(text, on_first_audio=on_first_audio)
+        t_local = time.time()
+        player = tts_moonshine.speak(text, on_first_audio=on_first_audio)
+        if player is not None:
+            _dl().tts("moonshine", "speak", "OK",
+                      detail="{} chars (fallback)".format(len(text)),
+                      seconds=time.time() - t_local)
+        else:
+            t_local = time.time()
+            player = tts_local.speak(text, on_first_audio=on_first_audio)
+            _dl().tts("kokoro", "speak", "OK",
+                      detail="{} chars (fallback)".format(len(text)),
+                      seconds=time.time() - t_local)
+    else:
+        _dl().tts("orpheus", "speak", "OK",
+                  detail="{} chars -> {} segments".format(
+                      len(text), len(pieces)),
+                  seconds=time.time() - t0)
 
     return player
 
@@ -778,12 +780,13 @@ def speak_stream(pieces, on_first_audio=None, expected_chars=None):
     survives that handoff even though `pieces` itself can only be drained
     once.
 
-    TTS_LOCAL_FIRST changes this path more than it changes speak(): Kokoro
-    (tts_local.speak()) takes complete text, not a live stream, so
-    local-first here means draining `pieces` fully before speaking a word
-    -- you lose the "starts on the first sentence" benefit this function
-    exists for, in exchange for not touching the cloud unless local fails.
-    Worth knowing before flipping it on for a chat-streamed reply.
+    TTS_LOCAL_FIRST changes this path more than it changes speak():
+    Moonshine (tts_moonshine.speak()) and Kokoro (tts_local.speak()) both
+    take complete text, not a live stream, so local-first here means
+    draining `pieces` fully before speaking a word -- you lose the "starts
+    on the first sentence" benefit this function exists for, in exchange
+    for not touching the cloud unless local fails. Worth knowing before
+    flipping it on for a chat-streamed reply.
     """
     if pieces is None:
         return None
@@ -794,20 +797,58 @@ def speak_stream(pieces, on_first_audio=None, expected_chars=None):
         text = " ".join(str(p) for p in wrapped if p)
         if not text.strip():
             return None
+        t0 = time.time()
+        player = tts_moonshine.speak(text, on_first_audio=on_first_audio)
+        if player is not None:
+            _dl().tts("moonshine", "speak_stream", "OK",
+                      detail="{} chars".format(len(text)),
+                      seconds=time.time() - t0)
+            return player
+        _dl().tts("moonshine", "speak_stream", "FAIL",
+                  detail="unavailable -> kokoro")
+        print("tts: Moonshine unavailable, trying Kokoro")
+        t0 = time.time()
         player = tts_local.speak(text, on_first_audio=on_first_audio)
         if player is not None:
+            _dl().tts("kokoro", "speak_stream", "OK",
+                      detail="{} chars".format(len(text)),
+                      seconds=time.time() - t0)
             return player
+        _dl().tts("kokoro", "speak_stream", "FAIL", detail="unavailable -> cloud")
         print("tts: local speech unavailable, falling back to cloud voice")
-        return _play(iter([text]), on_first_audio=on_first_audio,
-                      expected_chars=len(text))
+        t0 = time.time()
+        player = _play(iter([text]), on_first_audio=on_first_audio,
+                       expected_chars=len(text))
+        _dl().tts("orpheus", "speak_stream", "OK",
+                  detail="{} chars (fallback)".format(len(text)),
+                  seconds=time.time() - t0)
+        return player
 
+    t0 = time.time()
     player = _play(wrapped, on_first_audio=on_first_audio,
                     expected_chars=expected_chars)
 
     if player is None and captured:
         text = " ".join(str(p) for p in captured if p)
+        _dl().tts("orpheus", "speak_stream", "FAIL", detail="no audio -> local")
         print("tts: cloud speech unavailable, falling back to local voice")
-        player = tts_local.speak(text, on_first_audio=on_first_audio)
+        t_local = time.time()
+        player = tts_moonshine.speak(text, on_first_audio=on_first_audio)
+        if player is not None:
+            _dl().tts("moonshine", "speak_stream", "OK",
+                      detail="{} chars (fallback)".format(len(text)),
+                      seconds=time.time() - t_local)
+        else:
+            t_local = time.time()
+            player = tts_local.speak(text, on_first_audio=on_first_audio)
+            _dl().tts("kokoro", "speak_stream", "OK",
+                      detail="{} chars (fallback)".format(len(text)),
+                      seconds=time.time() - t_local)
+    else:
+        _dl().tts("orpheus", "speak_stream", "OK",
+                  detail="{} chars streamed".format(
+                      sum(len(str(p)) for p in captured)),
+                  seconds=time.time() - t0)
 
     return player
 

@@ -58,6 +58,8 @@ from listener import console_input
 from listener import cues
 from listener import stt_gemini
 from listener import stt_local
+from listener import stt_moonshine
+from listener import tts_moonshine
 from listener import stt_openrouter
 from listener import tts
 from listener import ui
@@ -65,7 +67,10 @@ from listener.audio_out import get_stream as get_output_stream, close_stream
 from commands import chat
 from commands import cmd_control
 from commands import confirm
+from commands import devlog
+from commands import logbook
 from commands import memory
+from commands import notify
 from commands.parser import parse_command, generate_reply, remember
 from commands.executor import execute_actions
 
@@ -105,6 +110,7 @@ SPOKEN_RESULTS = {
     "list_windows", "list_files", "find_file", "where_is",
     "read_clipboard", "run_command", "explain_command",
     "list_memory", "what_do_you_remember", "show_memory",
+    "understand_screen",
 }
 
 # How many times to re-record for an answer to a pending confirmation before
@@ -154,7 +160,13 @@ def save_wav_async(audio):
 
 
 def transcribe(audio):
-    """Gemini -> OpenRouter -> Vosk, in that order, first one that answers.
+    """Moonshine? -> Gemini -> OpenRouter -> Vosk, first one that answers.
+
+    JARVIS_STT_LOCAL_FIRST=1 (see .env.example) puts Moonshine -- an offline,
+    open-vocabulary local model -- at the FRONT of the chain. When it is set,
+    the cloud tiers become backups: nothing heard has to leave the machine.
+    Without the flag, Moonshine sits out entirely and the chain is the plain
+    Gemini -> OpenRouter -> Vosk it has always been.
 
     The middle tier exists because the two ends are further apart than they
     look. Gemini hears open-ended English; Vosk (listener/stt_local.py) runs a
@@ -167,29 +179,71 @@ def transcribe(audio):
     unplugged, and it answers in well under a second, which is what lets the
     OpenRouter tier keep a hard 12s deadline instead of retrying politely.
     """
+    if os.getenv("JARVIS_STT_LOCAL_FIRST") in ("1", "true", "TRUE", "yes"):
+        if stt_moonshine.available():
+            t0 = time.perf_counter()
+            try:
+                text = stt_moonshine.transcribe(audio)
+                if text:
+                    devlog.stt("moonshine", "transcribe", "OK",
+                               detail="...{}".format(text[-80:]) if len(text) > 80 else text,
+                               seconds=time.perf_counter() - t0)
+                    print('Heard (Moonshine): "{}"'.format(text))
+                    ui.set_heard(text)
+                    return text
+                # Moonshine returned "" (silence detected). Treat that the
+                # same as Vosk's "" would be -- let the chain decide.
+                devlog.stt("moonshine", "transcribe", "SKIP", detail="silence",
+                           seconds=time.perf_counter() - t0)
+                print("Heard (Moonshine): silence")
+            except Exception as e:
+                devlog.stt("moonshine", "transcribe", "FAIL",
+                           detail=str(e)[:120], seconds=time.perf_counter() - t0)
+                print("Moonshine STT failed ({}), trying Gemini...".format(e))
+        else:
+            devlog.stt("moonshine", "transcribe", "SKIP", detail="not installed")
+            print("Moonshine STT not installed, trying Gemini...")
+
+    t0 = time.perf_counter()
     try:
         text = stt_gemini.transcribe(audio)
+        devlog.stt("gemini", "transcribe", "OK",
+                   detail="...{}".format(text[-80:]) if len(text) > 80 else text,
+                   seconds=time.perf_counter() - t0)
         print('Heard (Gemini): "{}"'.format(text))
         ui.set_heard(text)
         return text
     except Exception as e:
+        devlog.stt("gemini", "transcribe", "FAIL",
+                   detail=str(e)[:120], seconds=time.perf_counter() - t0)
         print("Gemini STT failed ({}), trying OpenRouter...".format(e))
 
     # available() covers both "no key configured" and "cooling off after a
     # failure", so a machine that never set OPENROUTER_STT_API_KEY behaves
     # exactly as it did before this tier existed.
     if stt_openrouter.available():
+        t0 = time.perf_counter()
         try:
             text = stt_openrouter.transcribe(audio)
+            devlog.stt("openrouter", "transcribe", "OK",
+                       detail="...{}".format(text[-80:]) if len(text) > 80 else text,
+                       seconds=time.perf_counter() - t0)
             print('Heard (OpenRouter): "{}"'.format(text))
             ui.set_heard(text)
             return text
         except Exception as e:
+            devlog.stt("openrouter", "transcribe", "FAIL",
+                       detail=str(e)[:120], seconds=time.perf_counter() - t0)
             print("OpenRouter STT failed ({}), falling back to local...".format(e))
     else:
+        devlog.stt("openrouter", "transcribe", "SKIP", detail="unavailable")
         print("OpenRouter STT unavailable, falling back to local...")
 
+    t0 = time.perf_counter()
     text = stt_local.transcribe(audio)
+    devlog.stt("vosk", "transcribe", "OK",
+               detail="...{}".format(text[-80:]) if len(text) > 80 else text,
+               seconds=time.perf_counter() - t0)
     print('Heard (local): "{}"'.format(text))
     ui.set_heard(text)
     return text
@@ -286,6 +340,7 @@ class _Voice:
         self.wait()
         spoken = str(text)
         self._text = spoken
+        logbook.jarvis(spoken)
 
         def run():
             # speak() swallows its own failures, but it does network I/O on a
@@ -335,6 +390,7 @@ class _Voice:
             feeder.close()
 
         self._text = str(text or "")
+        logbook.jarvis(self._text)
         return self._text
 
     def wait(self):
@@ -388,6 +444,43 @@ def _resolve_confirmation(text, voice):
     print("confirm: unrelated reply, dropping the question")
     confirm.clear()
     return False
+
+
+def _answer_from_toast(text):
+    """Resolves a parked confirmation with an answer that came from a toast
+    (a [Yes]/[No] button or text typed into the notification).
+
+    Runs on the toast's background thread, not the wake loop, so it does its
+    own COM initialisation (the parked callable is often a delete) and reports
+    through a fresh voice. It resolves whichever confirmation is pending; the
+    wake loop's own follow-up listener sees is_pending() go false and moves on
+    without double-running the callable, because accept()/reject() pop it under
+    the same lock.
+    """
+    text = (text or "").strip()
+    if not text or not confirm.is_pending():
+        return
+    verdict = confirm.interpret(text)
+
+    comtypes.CoInitialize()
+    try:
+        if verdict is True:
+            result = confirm.accept()
+        elif verdict is False:
+            result = confirm.reject()
+        else:
+            # Neither clearly a yes nor a no (e.g. dismissed or gibberish).
+            # Leave it pending rather than inventing an answer -- it can still
+            # be answered by speaking or typing, and expires on its own.
+            return
+    finally:
+        comtypes.CoUninitialize()
+
+    if result:
+        print(result)
+        ui.set_reply(result)
+        _Voice({}, time.perf_counter()).say(result, background=False)
+        notify.notify("Jarvis", "Done: {}".format(result))
 
 
 def _chat_context(text, actions, results):
@@ -474,6 +567,7 @@ def _finish(marks, t_start):
     marks["spoken"] = time.perf_counter() - t_start
     timing = _format_timing(marks)
     ui.set_timing(timing)
+    devlog.turn("done", detail=timing, seconds=marks["spoken"])
     print("  timing: " + timing)
 
 
@@ -485,6 +579,7 @@ def _run_turn(text, t_start, marks):
     and whether marks["stt"] exists.
     """
     voice = _Voice(marks, t_start)
+    devlog.turn("start", detail="...{}".format(text[-80:]) if len(text) > 80 else text)
 
     # Nothing was said. Stop here, before the parked-question check and before
     # the router.
@@ -504,6 +599,8 @@ def _run_turn(text, t_start, marks):
         print("nothing heard")
         return
 
+    logbook.user(text)
+
     # A parked question owns the next thing said, whatever it was going to be.
     if confirm.is_pending():
         if _resolve_confirmation(text, voice):
@@ -514,6 +611,7 @@ def _run_turn(text, t_start, marks):
 
     def on_mode(mode):
         route["mode"] = mode
+        devlog.route("mode", "OK", mode)
         print("route: {}".format(mode))
         # True aborts the parse. Only for pure chat: there are no actions to
         # wait for, so every remaining token of the router's response is
@@ -537,6 +635,10 @@ def _run_turn(text, t_start, marks):
 
     mode, actions, reply = parse_command(text, on_reply=on_reply, on_mode=on_mode)
     marks["parse"] = time.perf_counter() - t_start
+    kinds = [a.get("action") if isinstance(a, dict) else "?" for a in actions]
+    devlog.route("parse", "OK", "mode={} actions={} {}".format(
+        mode, len(actions), kinds
+    ), seconds=marks["parse"])
     print("Mode: {} | actions: {}".format(mode, actions))
 
     if mode == "chat":
@@ -564,6 +666,7 @@ def _run_turn(text, t_start, marks):
             exec_box["results"] = run_actions(immediate)
         except Exception as e:
             exec_box["results"] = ["Failed to run that: {}".format(e)]
+            devlog.exec_event("-", "run", "FAIL", str(e)[:120])
             print("action execution failed: {}".format(e))
             traceback.print_exc()
 
@@ -605,6 +708,21 @@ def _run_turn(text, t_start, marks):
             ui.set_reply(line)
             voice.say(line, background=False)
 
+    # A toast whenever a task actually ran -- the spoken "done" is easy to miss
+    # when you're not looking at the terminal. Pure chat is skipped (the answer
+    # was already spoken), and so are failures (those get their own toast in
+    # the correction branch). When an action parked a confirmation, its result
+    # is the question itself, filtered out here so the toast doesn't read its
+    # own question back.
+    if mode != "chat" and not _failed(unspoken):
+        parked = (confirm.question() or "").strip()
+        done_lines = [
+            str(r).strip() for r in results
+            if str(r).strip() and str(r).strip() != parked
+        ]
+        if done_lines:
+            notify.notify("Done", " ".join(done_lines))
+
     # A parked question is the last word of the turn -- it has to be, since the
     # answer is the next thing the user says.
     if confirm.is_pending():
@@ -612,6 +730,11 @@ def _run_turn(text, t_start, marks):
         print('Jarvis asks: "{}"'.format(question))
         ui.set_reply(question)
         voice.say(question, background=False)
+        # An answerable toast: [Yes]/[No] buttons plus a text box, so the
+        # question can be answered from the notification without speaking or
+        # typing into the terminal. Falls back to a plain toast showing the
+        # question when no interactive backend is installed.
+        notify.confirm("Jarvis", question, _answer_from_toast)
         _finish(marks, t_start)
         return
 
@@ -629,6 +752,7 @@ def _run_turn(text, t_start, marks):
         print('Jarvis corrects: "{}"'.format(correction))
         ui.set_reply(correction)
         voice.say(correction, background=False)
+        notify.notify("Heads up", correction)
 
     _finish(marks, t_start)
 
@@ -733,6 +857,7 @@ def handle_typed(text):
     """
     t_start = time.perf_counter()
     marks = {}
+    devlog.wake("typed", detail="...{}".format(text[-80:]) if len(text) > 80 else text)
 
     ui.set_state(ui.THINKING)
     print('Typed: "{}"'.format(text))
@@ -954,6 +1079,7 @@ def _voice_loop(model, stream, typing):
         if not check_wake_word(model, data[:, 0]):
             continue
 
+        devlog.wake("detected", detail="hey_jarvis")
         _record_turn(stream)
         _settle(stream, model, typed=False)
         _follow_up(stream, model, typing)
@@ -1021,6 +1147,22 @@ def main():
     # suddenly went deaf. Say which tiers exist while there's still a log to
     # read it in.
     print(stt_openrouter.status())
+    devlog.sys_event("startup", "OK", "dev log on")
+    devlog.stt("moonshine", "setup", "INFO",
+               detail="available={} compression={}".format(
+                   stt_moonshine.available(),
+                   os.getenv("MOONSHINE_COMPRESSION", "medium_streaming")))
+    devlog.stt("gemini", "setup", "INFO",
+               detail="configured={}".format(bool(os.getenv("GEMINI_API_KEY"))))
+    devlog.stt("openrouter", "setup", "INFO",
+               detail="available={}".format(stt_openrouter.available()))
+    devlog.stt("vosk", "setup", "INFO", detail="always available (offline)")
+    devlog.tts("moonshine", "setup", "INFO",
+               detail="available={} voice={}".format(
+                   tts_moonshine.available(), os.getenv("MOONSHINE_VOICE", "kokoro_af_sky")))
+    devlog.tts("orpheus", "setup", "INFO",
+               detail="local_first={}".format(tts.TTS_LOCAL_FIRST))
+    devlog.tts("kokoro", "setup", "INFO", detail="offline fallback")
 
     ui.start()  # no-op when stdout isn't a terminal, or JARVIS_NO_UI is set
 

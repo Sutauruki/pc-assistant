@@ -48,6 +48,7 @@ import json
 import os
 import re
 import threading
+import time
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -107,6 +108,14 @@ installed on this particular machine, and the usual install path is not an
 answer to "where is it on MY system". Use mode "both" so what's found gets
 read back.
 
+"WHAT'S ON MY SCREEN" IS ALWAYS AN ACTION.
+Anything about what is visible on screen right now -- "what's on my screen",
+"what am I looking at", "what does that error say", "is that tab still
+loading", "what does the dialog in the middle say" -- is understand_screen,
+never chat. You have no idea what is on their screen, and answering from
+memory is always wrong. Copy their question into the "question" field almost
+verbatim and use mode "both" so the vision model's answer is read back.
+
 If you are unsure, prefer "chat". A wrong "chat" costs a moment; a wrong
 "command" does something to their computer that they did not ask for. But that
 tiebreak is about actions that CHANGE something. A read -- read_clipboard,
@@ -158,6 +167,9 @@ CLIPBOARD
 - {"action": "append_clipboard", "text": "<what to add>"}
 - {"action": "clear_clipboard"}
 - {"action": "open_link"}
+
+SCREEN
+- {"action": "understand_screen", "question": "<what they asked about what's on screen>"}
 
 NOTIFICATIONS
 - {"action": "notify", "title": "<short title>", "message": "<one line>"}
@@ -318,6 +330,15 @@ what's on my clipboard
 
 what did I copy
 {"mode": "both", "reply": "One sec.", "actions": [{"action": "read_clipboard"}]}
+
+what's on my screen
+{"mode": "both", "reply": "Let me take a look.", "actions": [{"action": "understand_screen", "question": "what's on my screen"}]}
+
+what am I looking at
+{"mode": "both", "reply": "One sec.", "actions": [{"action": "understand_screen", "question": "what am I looking at"}]}
+
+what does that error on screen say
+{"mode": "both", "reply": "Reading it.", "actions": [{"action": "understand_screen", "question": "what does that error on screen say"}]}
 
 what's in my downloads folder
 {"mode": "both", "reply": "Checking.", "actions": [{"action": "list_files", "target": "downloads"}]}
@@ -582,10 +603,14 @@ def parse_command(text, on_reply=None, on_mode=None):
     Never raises. A failure comes back as ("chat", [], <something to say>) so
     the turn still produces speech instead of silence.
     """
+    from commands import devlog  # local import: avoids an import cycle
+    t0 = time.time()
+
     if not text or not text.strip():
         fallback = "I didn't catch anything to do there."
         if on_reply is not None:
             on_reply(fallback)
+        devlog.route("parse", "SKIP", "empty input", seconds=time.time() - t0)
         return "chat", [], fallback
 
     messages = [{"role": "system", "content": _system_prompt()}]
@@ -602,6 +627,7 @@ def parse_command(text, on_reply=None, on_mode=None):
         )
     except Exception as e:
         print("parser: couldn't reach the model ({})".format(e))
+        devlog.route("reach", "FAIL", str(e)[:120], seconds=time.time() - t0)
         return "chat", [], "I couldn't reach my language model just then."
 
     buf = ""
@@ -655,10 +681,13 @@ def parse_command(text, on_reply=None, on_mode=None):
 
     if aborted:
         # Deliberate early exit. No actions were read, and none are wanted.
+        devlog.route("parse", "OK", "mode={} (aborted early)".format(mode),
+                     seconds=time.time() - t0)
         return mode, [], (reply or "")
 
     parsed = _load_object(buf)
     if parsed is None:
+        devlog.route("parse", "FAIL", "unparseable response", seconds=time.time() - t0)
         print("parser: couldn't parse the response -- {!r}".format(buf[:300]))
         return "chat", [], (reply or "Something went wrong parsing that, sorry.")
 
@@ -685,8 +714,15 @@ def parse_command(text, on_reply=None, on_mode=None):
     if mode == "command" and not actions:
         # The old behaviour, now reached only when the model insisted this was
         # a command and then handed over nothing to do.
+        devlog.route("parse", "OK", "mode={} no actions".format(mode),
+                     seconds=time.time() - t0)
         return mode, [], (reply or "I didn't catch anything to do there.")
 
+    devlog.route("parse", "OK",
+                 detail="mode={} actions={}".format(
+                     mode, [a.get("action") if isinstance(a, dict) else "?"
+                            for a in actions]),
+                 seconds=time.time() - t0)
     return mode, actions, reply
 
 
