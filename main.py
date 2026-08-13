@@ -132,6 +132,12 @@ CONFIRM_TYPED_SECONDS = 8.0
 
 _FAILURE_WORDS = ("failed", "couldn't", "didn't")
 
+# Recover from a vanishing input device (an unplugged headset raises
+# PortAudioError on the next stream.read). These bound how hard _listen_loop
+# tries to bring the mic back before surrendering to typed-only mode.
+MIC_RECONNECT_ATTEMPTS = 10
+MIC_RECONNECT_DELAY = 1.0
+
 def _write_wav(audio, filepath):
     with wave.open(filepath, "wb") as wf:
         wf.setnchannels(1)
@@ -1102,8 +1108,24 @@ def _typed_only_loop():
 
 
 def _listen_loop(model, typing):
+    # Attempts to bring the microphone back after it disappears. Unplugging a
+    # headset makes PortAudio raise on the next stream.read() -- previously
+    # that was a full crash. Instead: close, wait for the device to come back
+    # (Windows re-enumerates a replugged headset), and retry the open. Only
+    # give up to typed-input mode when nothing recovers.
+    def _open_with_retry():
+        last = None
+        for attempt in range(MIC_RECONNECT_ATTEMPTS):
+            try:
+                return _open_input_stream()
+            except Exception as e:
+                last = e
+                if attempt < MIC_RECONNECT_ATTEMPTS - 1:
+                    time.sleep(MIC_RECONNECT_DELAY)
+        raise last
+
     try:
-        stream = _open_input_stream()
+        stream = _open_with_retry()
     except Exception as e:
         if not typing:
             raise
@@ -1112,14 +1134,36 @@ def _listen_loop(model, typing):
         _typed_only_loop()
         return
 
-    try:
-        _voice_loop(model, stream, typing)
-    finally:
+    while True:
         try:
-            stream.stop()
-            stream.close()
+            _voice_loop(model, stream, typing)
+            return
+        except sd.PortAudioError as e:
+            # The device vanished mid-read (headset unplugged, driver blip).
+            # Close it and try to reopen; typed input still works meanwhile
+            # only if we come back to a fresh stream, so do that in-loop.
+            print("microphone lost ({}); reopening...".format(e))
+        except KeyboardInterrupt:
+            raise
+        finally:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception as e:
+                print("couldn't close the microphone: {}".format(e))
+
+        try:
+            stream = _open_with_retry()
         except Exception as e:
-            print("couldn't close the microphone: {}".format(e))
+            if typing:
+                print("microphone didn't come back ({}) -- typed input only".format(e))
+                ui.set_state(ui.LISTENING)
+                _typed_only_loop()
+                return
+            raise
 
 
 def main():
@@ -1131,6 +1175,10 @@ def main():
     get_output_stream()  # open the speaker up front so the first reply isn't slow
     cues.warm()  # render the earcons now, not while you're waiting to talk
     chat.warm()  # fetch the free-model list on a thread, off the first question
+    # Loading the Moonshine synthesizer takes several seconds on first use --
+    # if it isn't warmed, the first reply pays that latency on top of the
+    # reply itself. Warm it on a thread during startup instead.
+    tts_moonshine.warm()
 
     # Read the preferences file now rather than on the first turn that needs
     # it. It's a few hundred bytes, and doing it here means the "loaded N

@@ -81,13 +81,48 @@ def load_model():
 
 
 def warm():
-    """Pre-loads the synthesizer on a background thread at startup."""
+    """Pre-loads the synthesizer on a background thread at startup.
+
+    No-op when the package is missing -- the same available() check speak()
+    would hit anyway, just without paying the ImportError on the first reply.
+    """
+    if not available():
+        return
     threading.Thread(target=load_model, daemon=True).start()
 
 
 def _sentences(text):
     from moonshine_voice.tts import split_say_utterances
     return split_say_utterances(str(text or ""))
+
+
+# Replies up to this many characters are synthesized as ONE moonshine C call.
+# On this machine every call carries ~3s of fixed overhead (G2P + init) and
+# runs slower than realtime, so splitting a short reply on its sentence
+# boundaries makes it SLOWER: "That's great! Let me open it." is two calls
+# (~19s) versus one call (~11s), and the second piece lands after a dead gap.
+# Short replies are the normal case (parser replies are one sentence), so one
+# call is the right trade. Only long text gets chunked, to bound call size.
+_MAX_ONE_CALL_CHARS = 180
+
+
+def _chunks(text):
+    """Sentence pieces, coalesced so short replies stay a single C call."""
+    pieces = _sentences(text)
+    if not pieces:
+        return []
+    if len(text) <= _MAX_ONE_CALL_CHARS:
+        return [str(text).strip()]
+    chunks, buf = [], ""
+    for piece in pieces:
+        if buf and len(buf) + 1 + len(piece) > _MAX_ONE_CALL_CHARS:
+            chunks.append(buf)
+            buf = piece
+        else:
+            buf = "{} {}".format(buf, piece).strip() if buf else piece
+    if buf:
+        chunks.append(buf)
+    return chunks
 
 
 def _to_pcm16(samples):
@@ -99,12 +134,20 @@ def _to_pcm16(samples):
 def speak(text, on_first_audio=None):
     """Synthesizes and plays text offline. Mirrors tts_local.speak()'s
     interface: returns the StreamingPlayer, or None when nothing could be
-    produced."""
+    produced.
+
+    The text is coalesced into the fewest possible moonshine C calls
+    (_chunks): a short reply is ONE call, so a mid-reply "!" no longer means
+    two fixed-overhead synthesis passes (which, on this machine, is what made
+    the pause after an exclamation feel awful). Chunks are synthesized in a
+    background worker while the player streams each one as it arrives, so a
+    long reply still starts talking before the tail is synthesized.
+    """
     if not text or not str(text).strip():
         return None
 
-    pieces = _sentences(text)
-    if not pieces:
+    chunks = _chunks(text)
+    if not chunks:
         return None
 
     try:
@@ -119,13 +162,13 @@ def speak(text, on_first_audio=None):
 
     def synthesise():
         try:
-            for piece in pieces:
+            for chunk in chunks:
                 if stop.is_set():
                     break
                 try:
                     # (samples, sample_rate) -- raw floats straight from the
                     # Moonshine core, no post-processing.
-                    samples, sr = tts.synthesize(piece)
+                    samples, sr = tts.synthesize(chunk)
                     if samples is None or len(samples) == 0:
                         continue
                     rate = int(sr)
@@ -133,7 +176,7 @@ def speak(text, on_first_audio=None):
                     if pcm:
                         out.put((rate, pcm))
                 except Exception as e:
-                    print("tts_moonshine: synthesis failed on segment ({})".format(e))
+                    print("tts_moonshine: synthesis failed on chunk ({})".format(e))
         finally:
             out.put(_DONE)
 
