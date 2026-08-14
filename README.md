@@ -8,24 +8,23 @@ history, notifications and an action-confirmation protocol.
 
 - **Wake word loop** — openWakeWord (`hey_jarvis`), cooldown model reset, typed
   turns bypass the cooldown.
-- **STT with a fallback chain** — Moonshine (offline, open-vocabulary), Vosk
-  (offline, command grammar), Gemini, or OpenRouter/Groq. With
-  `JARVIS_STT_LOCAL_FIRST=1` hearing is fully local and private. Startup prints
-  which tiers are configured (`stt_openrouter.status()`).
+- **STT** — Moonshine, a single fully-offline, open-vocabulary tier (no cloud,
+  no key, no rate limit). Nothing spoken has to leave the machine.
 - **Command router** (`commands/parser.py`) — classifies a turn as `command`,
   `chat`, or `both`. Chat-only turns are answered without touching the action
   engine; `both` runs the action and feeds its real output back to the brain.
 - **15 command modules** — see table below.
-- **TTS** — cloud (Groq voices) and/or local (piper, Kokoro, edge-tts) with
-  overlap: the reply starts while actions are still running.
+- **TTS** — Moonshine's local voices (Kokoro/Piper, via its C core), played
+  straight through with no time-stretch, with overlap: the reply starts while
+  actions are still running.
 - **Screen understanding** — grabs the screen, downscales to 640×360 JPEG
   quality 55, and answers "what's on my screen" / "what does that error say" via
   Gemini Vision (`commands/screen_actions.py`).
 - **Detailed dev log** — `DEV_LOG=1` in `.env` appends a second, densely
-  formatted log to `dev_log.txt`: every STT tier attempt (which one, how long),
-  every TTS provider/segment/fallback, the chat model chain and each model's
-  latency, action executions, wake/typed events and per-turn timings, all in
-  aligned columns (`commands/devlog.py`). Off by default.
+  formatted log to `dev_log.txt`: every STT attempt, every TTS synthesis,
+  the chat model chain and each model's latency, action executions, wake/typed
+  events and per-turn timings, all in aligned columns (`commands/devlog.py`).
+  Off by default.
 - **Typed input** — full command parser available from the keyboard; typed turns
   skip the 0.4 s wake-word cooldown entirely.
 - **Console UI** (`listener/ui.py`) — live ring, STT/TTS status, latency and
@@ -65,13 +64,11 @@ No manual download step.
 
 | Variable | Used by | Required |
 |---|---|---|
-| `JARVIS_STT_LOCAL_FIRST` | `1` puts the offline Moonshine tier first (`main.py:transcribe`) | only if you want local-first hearing |
-| `MOONSHINE_COMPRESSION` | Moonshine model size (`listener/stt_moonshine.py`); default `medium_streaming` | optional |
-| `GEMINI_API_KEY` | Gemini STT tier (`listener/stt_gemini.py`) | only if that tier is used |
-| `OPENROUTER_STT_API_KEY` | OpenRouter STT tier (`listener/stt_openrouter.py`) | only if that tier is used |
-| `OPENROUTER_API_KEY` | STT fallback + chat brain (`commands/chat.py:184`) | for chat / fallback |
+| `MOONSHINE_COMPRESSION` | Moonshine STT model size (`listener/stt_moonshine.py`); default `medium_streaming` | optional |
+| `MOONSHINE_VOICE` | Moonshine TTS voice (`listener/tts_moonshine.py`); default `kokoro_af_sky` | optional |
+| `GEMINI_API_KEY` | screen understanding (`commands/screen_actions.py`) | only if that feature is used |
+| `OPENROUTER_API_KEY` | chat brain (`commands/chat.py:184`) | for conversational chat |
 | `GROQ_API_KEY` | parser brain (`commands/parser.py:388`) | for command routing |
-| `GROQ_TTS_API_KEY` | cloud TTS (`listener/tts.py:216`); falls back to `GROQ_API_KEY` | only if cloud TTS used |
 | `JARVIS_NO_UI` | set non-empty to force the terminal UI off | optional |
 | `JARVIS_NO_TYPING` | set non-empty to disable typed input (voice still works) | optional |
 | `DEV_LOG` | `1` writes a detailed machine log to `dev_log.txt` (every STT/TTS/thinking/action event with timings, aligned columns) | optional |
@@ -82,7 +79,7 @@ No manual download step.
 |---|---|---|
 | `COOLDOWN_SECONDS` | 0.4 | sleep after a wake-word hit (model is reset explicitly) |
 | `TYPED_COOLDOWN_SECONDS` | 0.0 | no cooldown for typed turns |
-| `SAVE_RECORDINGS` | `True` | writes user recordings to `recordings/` |
+| `SAVE_RECORDINGS` | `True` | writes user recordings to `%LOCALAPPDATA%\\Jarvis\\recordings` |
 | `OVERLAP_SPEECH_AND_ACTIONS` | `True` | reply starts while actions still run |
 | `DEFERRED_ACTIONS` | `{"set_volume"}` | actions that wait for speech to finish before running |
 | `SPOKEN_RESULTS` | set | actions whose result IS the spoken answer |
@@ -113,10 +110,9 @@ No manual download step.
 
 ## How a turn flows
 
-Wake or typed input → `record_until_silence` (16 kHz) → STT tier (Moonshine →
-Gemini → OpenRouter → Vosk, or the same chain with Moonshine first when
-`JARVIS_STT_LOCAL_FIRST=1`) → `parse_command` routes `command` / `chat` /
-`both` → `execute_actions` on a worker thread → reply via the TTS tier → the
+Wake or typed input → `record_until_silence` (16 kHz) → Moonshine STT (fully
+offline) → `parse_command` routes `command` / `chat` / `both` →
+`execute_actions` on a worker thread → reply via Moonshine TTS → the
 UI ring/status updates per state (`LISTENING` / `THINKING` / `SPEAKING`).
 
 *One player per turn*: every path speaks through a single `_Voice` handle that
@@ -125,5 +121,5 @@ joins the previous thread first, so replies never interleave.
 Design notes and known trade-offs live in `BRAHMA_ECHO_REFERENCE.md`.
 
 When `DEV_LOG=1`, the same turn also writes aligned rows to `dev_log.txt` —
-STT tier attempts, TTS segments and fallbacks, the chat model chain with each
-model's latency, action executions, and per-turn timings.
+STT, TTS, the chat model chain with each model's latency, action executions,
+and per-turn timings.

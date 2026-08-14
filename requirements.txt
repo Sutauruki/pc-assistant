@@ -16,18 +16,11 @@ openwakeword>=0.6.0
 # wheels). wake_word.py pins inference_framework="onnx" on Windows.
 onnxruntime>=1.19
 
-# --- Speech-to-text ---
-vosk>=0.3.45                  # offline ("local") tier
-moonshine-voice>=0.1          # offline open-vocabulary tier (JARVIS_STT_LOCAL_FIRST)
-google-generativeai>=0.7      # Gemini cloud tier
-groq>=0.9                     # Groq/OpenRouter cloud tier
+# --- Speech-to-text / text-to-speech ---
+moonshine-voice>=0.1          # offline open-vocabulary STT + Kokoro-style TTS
+google-genai>=2.0             # screen understanding (commands/screen_actions.py)
+groq>=0.9                     # command parser / chat brain
 httpx>=0.27                   # used directly alongside groq
-
-# --- Text-to-speech ---
-groq>=0.9                     # cloud tier (Groq / OpenRouter voices)
-piper-tts>=1.2                # offline piper voices
-kokoro-onnx                   # offline Kokoro voices
-edge-tts>=6.1                 # Microsoft edge/neural voices
 
 # --- System control & command modules ---
 psutil>=5.9                   # processes / windows / self-guard

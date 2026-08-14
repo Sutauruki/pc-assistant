@@ -14,7 +14,7 @@ functions, and every missing piece returns a visible "couldn't" message that
 main.py turns into a spoken correction -- never a silent None.
 
     .env
-    GEMINI_API_KEY=sk-...   # shared with the Gemini STT tier
+    GEMINI_API_KEY=sk-...
 """
 
 import io
@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-MODEL_NAME = "gemini-3.6-flash"  # same model the Gemini STT tier uses
+MODEL_NAME = "gemini-3.6-flash"
 
 # Largest edge of the image sent to the model. Matches the reference's
 # 640x360 -- big enough to read an error dialog, small enough to round-trip

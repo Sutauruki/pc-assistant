@@ -43,6 +43,7 @@ interleave.
 """
 
 import os
+import subprocess
 import threading
 import time
 import traceback
@@ -56,11 +57,8 @@ from listener.wake_word import load_wake_word_model, check_wake_word
 from listener.record import record_until_silence
 from listener import console_input
 from listener import cues
-from listener import stt_gemini
-from listener import stt_local
 from listener import stt_moonshine
 from listener import tts_moonshine
-from listener import stt_openrouter
 from listener import tts
 from listener import ui
 from listener.audio_out import get_stream as get_output_stream, close_stream
@@ -86,8 +84,34 @@ COOLDOWN_SECONDS = 0.4
 # such problem, and waiting 0.4s after pressing Enter just feels broken.
 TYPED_COOLDOWN_SECONDS = 0.0
 
-RECORDINGS_DIR = "recordings"
-SAVE_RECORDINGS = True  # set False to skip disk writes entirely
+def _recordings_dir():
+    """Where clips live: per-user app data, not the project tree.
+
+    A recordings folder next to the code is something a user finds, opens, and
+    worries about. %LOCALAPPDATA%\\Jarvis is where Windows programs put state
+    nobody should need to see, and a voice assistant storing what it hears in
+    a browseable project folder is a bad look on top of being bad practice.
+    Falls back to a local folder when LOCALAPPDATA isn't set (non-Windows).
+    """
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        return os.path.join(base, "Jarvis", "recordings")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
+
+
+RECORDINGS_DIR = _recordings_dir()
+SAVE_RECORDINGS = True  # set False to skip disk writes entirely.
+
+# Recordings exist to be inspected for a few seconds after a turn (did it
+# hear what I think I said?), not for the long haul. Deleting each clip this
+# long after it was written keeps the folder tens of megabytes instead of
+# gigabytes. Anything left over (a crash, a kill -9) is swept on startup.
+RECORDING_RETENTION_SECONDS = 60.0
+
+# Safety net on top of the retention timer: even if a clip can't be deleted
+# (file locked, transient failure), the oldest ones make room. The retention
+# timer is the plan; this is the roof.
+MAX_RETAINED_RECORDINGS = 100
 
 # Speaking and acting at the same time is what removed the dead air -- the
 # reply starts while apps are still launching. Set False to go back to
@@ -146,112 +170,127 @@ def _write_wav(audio, filepath):
         wf.writeframes(audio.tobytes())
 
 
+def _hide_dir(path):
+    """Best-effort Windows 'hidden' attribute on a directory. Fails silently:
+    a visible recordings folder is an aesthetic issue, not an error."""
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["attrib", "+h", path], check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+
 def save_wav_async(audio):
     """Archives the clip on a background thread. The old code wrote to disk
     *before* transcribing, putting file I/O on the critical path for no
-    reason -- STT works off the in-memory array."""
+    reason -- STT works off the in-memory array. The clip self-deletes after
+    RECORDING_RETENTION_SECONDS, so the folder stays small on its own."""
     if not SAVE_RECORDINGS:
         return
 
     filename = "recording_{}.wav".format(time.strftime("%Y%m%d_%H%M%S"))
+    filepath = os.path.join(RECORDINGS_DIR, filename)
 
     def run():
         try:
             os.makedirs(RECORDINGS_DIR, exist_ok=True)
-            _write_wav(audio, os.path.join(RECORDINGS_DIR, filename))
+            _hide_dir(RECORDINGS_DIR)
+            _write_wav(audio, filepath)
+            time.sleep(RECORDING_RETENTION_SECONDS)
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
         except Exception as e:
             print("Failed to archive recording: {}".format(e))
 
     threading.Thread(target=run, daemon=True).start()
 
 
-def transcribe(audio):
-    """Moonshine? -> Gemini -> OpenRouter -> Vosk, first one that answers.
+def sweep_recordings():
+    """Called at startup: clear clips no process will ever delete.
 
-    JARVIS_STT_LOCAL_FIRST=1 (see .env.example) puts Moonshine -- an offline,
-    open-vocabulary local model -- at the FRONT of the chain. When it is set,
-    the cloud tiers become backups: nothing heard has to leave the machine.
-    Without the flag, Moonshine sits out entirely and the chain is the plain
-    Gemini -> OpenRouter -> Vosk it has always been.
-
-    The middle tier exists because the two ends are further apart than they
-    look. Gemini hears open-ended English; Vosk (listener/stt_local.py) runs a
-    26-word command grammar. So a rate limit or a 502 -- not a broken machine,
-    just a bad few seconds -- used to turn "where is chrome located on my
-    system" into the one word of it Vosk knows. One cloud tier failing should
-    cost accuracy, not vocabulary.
-
-    Vosk stays last on purpose. It is the tier that still works with the router
-    unplugged, and it answers in well under a second, which is what lets the
-    OpenRouter tier keep a hard 12s deadline instead of retrying politely.
+    A clip's deletion is scheduled on the thread that wrote it, so a crash or
+    a force-kill leaves the whole backlog behind. Retention is a guarantee
+    only for a healthy process, and this sweeps the folder back to before the
+    retention window -- and, as a roof, to MAX_RETAINED_RECORDINGS even if
+    timestamps are broken or clock-skewed.
     """
-    if os.getenv("JARVIS_STT_LOCAL_FIRST") in ("1", "true", "TRUE", "yes"):
-        if stt_moonshine.available():
-            t0 = time.perf_counter()
+    if not SAVE_RECORDINGS:
+        return
+    if not os.path.isdir(RECORDINGS_DIR):
+        os.makedirs(RECORDINGS_DIR, exist_ok=True)
+    _hide_dir(RECORDINGS_DIR)
+    if not os.path.isdir(RECORDINGS_DIR):
+        return
+
+    cutoff = time.time() - RECORDING_RETENTION_SECONDS
+    retained = []
+    try:
+        for name in os.listdir(RECORDINGS_DIR):
+            if not name.endswith(".wav"):
+                continue
+            path = os.path.join(RECORDINGS_DIR, name)
             try:
-                text = stt_moonshine.transcribe(audio)
-                if text:
-                    devlog.stt("moonshine", "transcribe", "OK",
-                               detail="...{}".format(text[-80:]) if len(text) > 80 else text,
-                               seconds=time.perf_counter() - t0)
-                    print('Heard (Moonshine): "{}"'.format(text))
-                    ui.set_heard(text)
-                    return text
-                # Moonshine returned "" (silence detected). Treat that the
-                # same as Vosk's "" would be -- let the chain decide.
-                devlog.stt("moonshine", "transcribe", "SKIP", detail="silence",
-                           seconds=time.perf_counter() - t0)
-                print("Heard (Moonshine): silence")
-            except Exception as e:
-                devlog.stt("moonshine", "transcribe", "FAIL",
-                           detail=str(e)[:120], seconds=time.perf_counter() - t0)
-                print("Moonshine STT failed ({}), trying Gemini...".format(e))
-        else:
-            devlog.stt("moonshine", "transcribe", "SKIP", detail="not installed")
-            print("Moonshine STT not installed, trying Gemini...")
+                mtime = os.path.getmtime(path)
+            except OSError:
+                os.remove(path)
+                continue
+            if mtime < cutoff:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            else:
+                retained.append((mtime, path))
+
+        retained.sort()
+        while len(retained) > MAX_RETAINED_RECORDINGS:
+            _, old = retained.pop(0)
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    except OSError as e:
+        print("couldn't sweep recordings: {}".format(e))
+
+
+def transcribe(audio):
+    """Moonshine -- the only ear, and a fully offline one.
+
+    Gemini, OpenRouter and Vosk are gone; nothing heard here has to leave the
+    machine. Moonshine is open-vocabulary, so a long free-form question
+    survives contact with the transcript just as well as a one-word command.
+    """
+    if not stt_moonshine.available():
+        devlog.stt("moonshine", "transcribe", "SKIP", detail="not installed")
+        print("Moonshine STT not installed")
+        return ""
 
     t0 = time.perf_counter()
     try:
-        text = stt_gemini.transcribe(audio)
-        devlog.stt("gemini", "transcribe", "OK",
+        text = stt_moonshine.transcribe(audio)
+    except Exception as e:
+        devlog.stt("moonshine", "transcribe", "FAIL",
+                   detail=str(e)[:120], seconds=time.perf_counter() - t0)
+        print("Moonshine STT failed ({}).".format(e))
+        return ""
+
+    if text:
+        devlog.stt("moonshine", "transcribe", "OK",
                    detail="...{}".format(text[-80:]) if len(text) > 80 else text,
                    seconds=time.perf_counter() - t0)
-        print('Heard (Gemini): "{}"'.format(text))
+        print('Heard (Moonshine): "{}"'.format(text))
         ui.set_heard(text)
-        return text
-    except Exception as e:
-        devlog.stt("gemini", "transcribe", "FAIL",
-                   detail=str(e)[:120], seconds=time.perf_counter() - t0)
-        print("Gemini STT failed ({}), trying OpenRouter...".format(e))
-
-    # available() covers both "no key configured" and "cooling off after a
-    # failure", so a machine that never set OPENROUTER_STT_API_KEY behaves
-    # exactly as it did before this tier existed.
-    if stt_openrouter.available():
-        t0 = time.perf_counter()
-        try:
-            text = stt_openrouter.transcribe(audio)
-            devlog.stt("openrouter", "transcribe", "OK",
-                       detail="...{}".format(text[-80:]) if len(text) > 80 else text,
-                       seconds=time.perf_counter() - t0)
-            print('Heard (OpenRouter): "{}"'.format(text))
-            ui.set_heard(text)
-            return text
-        except Exception as e:
-            devlog.stt("openrouter", "transcribe", "FAIL",
-                       detail=str(e)[:120], seconds=time.perf_counter() - t0)
-            print("OpenRouter STT failed ({}), falling back to local...".format(e))
     else:
-        devlog.stt("openrouter", "transcribe", "SKIP", detail="unavailable")
-        print("OpenRouter STT unavailable, falling back to local...")
-
-    t0 = time.perf_counter()
-    text = stt_local.transcribe(audio)
-    devlog.stt("vosk", "transcribe", "OK",
-               detail="...{}".format(text[-80:]) if len(text) > 80 else text,
-               seconds=time.perf_counter() - t0)
-    print('Heard (local): "{}"'.format(text))
-    ui.set_heard(text)
+        # Moonshine returned "" (silence detected). "Nothing heard" is a real
+        # answer, not a failure -- _run_turn already knows what to do with it.
+        devlog.stt("moonshine", "transcribe", "SKIP", detail="silence",
+                   seconds=time.perf_counter() - t0)
+        print("Heard (Moonshine): silence")
     return text
 
 
@@ -597,10 +636,10 @@ def _run_turn(text, t_start, marks):
     # who said nothing, because it throws away a pending delete confirmation
     # and then asks the router to route silence.
     #
-    # This got more likely with the OpenRouter STT tier, which returns "" for
-    # silence on purpose (as distinct from raising, which means the tier
-    # failed and Vosk should try). Gemini and Vosk can both return "" too, so
-    # this was always reachable -- it just needed a clear enough owner to fix.
+    # This got more likely when the STT tier's contract became "return "" for
+    # silence rather than raise" -- an empty transcript is a real answer, not
+    # a failure, and routing it as a turn would ask the router to route
+    # silence.
     if not text or not str(text).strip():
         print("nothing heard")
         return
@@ -744,7 +783,7 @@ def _run_turn(text, t_start, marks):
         _finish(marks, t_start)
         return
 
-    # Only pay for a second Groq + TTS round trip if something actually failed
+    # Only pay for a second synthesis + TTS round trip if something actually failed
     # AND the user hasn't already heard it. `run_command` is in SPOKEN_RESULTS,
     # so a failing command's output was just read out verbatim; paraphrasing it
     # here said the same thing twice, several seconds apart. The correction is
@@ -857,7 +896,7 @@ def handle_typed(text):
     """Typed turn: identical to a spoken one, minus the microphone.
 
     Worth noting how much this skips -- no recording, no silence detection,
-    no Gemini round trip. A typed command reaches the parser roughly two to
+    no STT round trip. A typed command reaches the parser roughly two to
     four seconds sooner than the same words spoken, which is why this is the
     fastest way to test a change.
     """
@@ -1190,27 +1229,16 @@ def main():
     except Exception as e:
         print("couldn't load preferences: {}".format(e))
 
-    # Same reasoning as the line above: a middle STT tier that isn't configured
-    # is invisible until the day Gemini blips, and then it looks like Jarvis
-    # suddenly went deaf. Say which tiers exist while there's still a log to
-    # read it in.
-    print(stt_openrouter.status())
+    sweep_recordings()  # clear clips orphaned by a crash or force-kill
+
     devlog.sys_event("startup", "OK", "dev log on")
     devlog.stt("moonshine", "setup", "INFO",
                detail="available={} compression={}".format(
                    stt_moonshine.available(),
                    os.getenv("MOONSHINE_COMPRESSION", "medium_streaming")))
-    devlog.stt("gemini", "setup", "INFO",
-               detail="configured={}".format(bool(os.getenv("GEMINI_API_KEY"))))
-    devlog.stt("openrouter", "setup", "INFO",
-               detail="available={}".format(stt_openrouter.available()))
-    devlog.stt("vosk", "setup", "INFO", detail="always available (offline)")
     devlog.tts("moonshine", "setup", "INFO",
                detail="available={} voice={}".format(
                    tts_moonshine.available(), os.getenv("MOONSHINE_VOICE", "kokoro_af_sky")))
-    devlog.tts("orpheus", "setup", "INFO",
-               detail="local_first={}".format(tts.TTS_LOCAL_FIRST))
-    devlog.tts("kokoro", "setup", "INFO", detail="offline fallback")
 
     ui.start()  # no-op when stdout isn't a terminal, or JARVIS_NO_UI is set
 

@@ -22,7 +22,7 @@ turn visible at a glance:
     timestamp  category  service            event          status   duration  detail
     14:32:05.123  STT  moonshine          transcribe      OK          1.24s  "open chrome"
     14:32:06.000  PARSER  gpt-oss-20b     route           OK          0.62s  mode=command
-    14:32:06.500  TTS  orpheus            speak           OK          2.10s  1 segment / 8 chars
+    14:32:06.500  TTS  moonshine          speak           OK          2.10s  12 chars
 
 Duration is right-aligned in its column so timings line up down the file; the
 detail column is free-form and may be empty.
@@ -153,6 +153,6 @@ if __name__ == "__main__":
     turn("start", detail='"open chrome"')
     route("route", "OK", "mode=command", 0.42)
     exec_event("open_app", "run", "OK", '"Chrome"', 1.1)
-    tts("orpheus", "speak", "OK", "1 segment / 12 chars", 0.8)
+    tts("moonshine", "speak", "OK", "12 chars", 0.8)
     turn("done", "OK", "1.9s total")
     print("wrote a sample turn to {}".format(LOG_PATH))

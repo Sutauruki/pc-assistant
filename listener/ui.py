@@ -87,6 +87,14 @@ _STATE_STYLE = {
 FPS = 24
 MAX_WIDTH = 84
 
+# While the panel is idle -- LISTENING with no audio and no log traffic --
+# the ring still animates, so a full 24fps repaint of the console (a slow,
+# synchronous write on Windows) is pure waste for a listener that sits there
+# all day. After IDLE_FRAMES of silence the render loop drops to every Nth
+# frame; the wobble keeps moving, just at a fraction of the CPU cost.
+IDLE_FRAMES = FPS * 2   # 2s of quiet before throttling
+IDLE_SKIP = 4           # repaint once every 4 frames while idle
+
 # Ring size, in terminal columns. Rows are derived from this (see
 # _ring_rows_count) so the shape stays round rather than egg-shaped --
 # don't set rows independently.
@@ -314,14 +322,15 @@ class Dashboard(object):
         self._last_level = 0.0
         self._spin = 0
         self._tick = 0
+        self._last_activity = 0
 
         self._heard = ""
         self._reply = ""
         self._timing = ""
 
         # Info column (the mockup's rows to the right of the ring).
-        self._stt = "gemini"
-        self._tts = "groq · cloud"
+        self._stt = "moonshine"
+        self._tts = "moonshine"
         self._latency = "1.4s"
         self._turns = 0
         self._t0 = None
@@ -472,6 +481,7 @@ class Dashboard(object):
         with self._lock:
             if state != self._state:
                 self._state = state
+                self._last_activity = self._tick
                 # Drop levels captured under the previous state -- a peak left
                 # over from the mic shouldn't open the playback wave, and a
                 # delayed playback level shouldn't land after we've gone back
@@ -501,6 +511,20 @@ class Dashboard(object):
         slot = min(int(round(delay * FPS)), MAX_DELAY_FRAMES) if delay > 0 else 0
 
         with self._level_lock:
+            # A real signal keeps the render loop at full rate. The mic
+            # pushes near-zero RMS a dozen times a second even in a silent
+            # room -- that must NOT count as activity, or the idle throttle
+            # would never engage and 24/7 listening would repaint at full
+            # FPS forever.
+            #
+            # No `_lock` here, even though the render thread reads
+            # _last_activity under it: this method runs on the thread
+            # feeding the sound card and must never block on the console
+            # write (see the note in __init__). A plain int store is atomic
+            # under the GIL, and a one-tick lag in the throttle is harmless.
+            if level > 0.01:
+                self._last_activity = self._tick
+
             if slot <= 0:
                 if self._pending is None or level > self._pending:
                     self._pending = level
@@ -533,7 +557,7 @@ class Dashboard(object):
 
     def set_engine(self, stt=None, tts=None):
         """Info column: the STT and TTS backend labels the mockup shows as
-        "gemini" and "groq · cloud"."""
+        "moonshine" and "moonshine"."""
         if stt is None and tts is None:
             return
         with self._lock:
@@ -634,7 +658,9 @@ class Dashboard(object):
             try:
                 with self._lock:
                     self._advance_locked()
-                    self._draw_locked()
+                    idle = (self._tick - self._last_activity) > IDLE_FRAMES
+                    if not idle or self._tick % IDLE_SKIP == 0:
+                        self._draw_locked()
             except Exception:
                 # A render bug must never be the thing that kills the
                 # assistant. Drop the frame and try again next tick.
@@ -773,13 +799,23 @@ class Dashboard(object):
         border = _fg(BORDER_RGB)
         reset = "\x1b[0m"
 
+        # Rows the terminal can hold, minus two spare so a transient extra
+        # row -- the toast, a state change, an input line -- can't push the
+        # panel into the "too tall, draw nothing" path and make the whole UI
+        # vanish until whatever added the row goes away.
+        budget = self._terminal_size()[1] - 2
+
         if self._history_on:
             rows = self._history_rows(box, inner, border, reset, accent)
-            if len(rows) + 2 > self._terminal_size()[1]:
-                return None
+            if len(rows) > budget:
+                # History overlay too tall for the terminal: fall back to the
+                # live panel rather than blanking the screen.
+                self._history_on = False
+                try:
+                    return self._frame_locked()
+                finally:
+                    self._history_on = True
             return "\n".join(rows)
-
-        rows = []
 
         # --- header: ╭─ JARVIS ────────── ● SPEAKING ─╮
         marker = box["dot"]
@@ -795,62 +831,75 @@ class Dashboard(object):
         # header spends 8 on borders and padding; fill takes up the slack.
         fill = max(1, (inner + 4) - 8 - len(title) - len(status))
 
-        rows.append(
-            border + box["tl"] + box["h"] + " " + reset
-            + _fg(TEXT_RGB) + title + reset
-            + " " + border + box["h"] * fill + " " + reset
-            + _fg(accent) + status + reset
-            + border + " " + box["h"] + box["tr"] + reset
-        )
+        def build(with_toast, with_timing):
+            rows = [
+                border + box["tl"] + box["h"] + " " + reset
+                + _fg(TEXT_RGB) + title + reset
+                + " " + border + box["h"] * fill + " " + reset
+                + _fg(accent) + status + reset
+                + border + " " + box["h"] + box["tr"] + reset,
+            ]
 
-        # --- ring + info column
-        # Derived from `inner` rather than re-measuring the terminal, same
-        # reasoning as the old wave: a resize between the two reads would
-        # put the ring and the borders on different widths for a frame. The
-        # ring sits left, the mockup's STT/TTS/latency/sparkline/turns
-        # stats sit to its right.
-        ring_cols = self._ring_cols()
-        for row in self._ring_info_rows(ring_cols, accent, inner):
-            rows.append(row)
+            # --- ring + info column
+            # Derived from `inner` rather than re-measuring the terminal, same
+            # reasoning as the old wave: a resize between the two reads would
+            # put the ring and the borders on different widths for a frame.
+            # The ring sits left, the mockup's STT/TTS/latency/sparkline/turns
+            # stats sit to its right.
+            ring_cols = self._ring_cols()
+            rows.extend(self._ring_info_rows(ring_cols, accent, inner))
 
-        rows.append(
-            border + box["ml"] + box["h"] * (inner + 2) + box["mr"] + reset
-        )
+            rows.append(
+                border + box["ml"] + box["h"] * (inner + 2) + box["mr"] + reset
+            )
 
-        # --- transient toast: the most recent log line, which clears on its
-        # own after TOAST_SECONDS (see _advance_locked). Dim so it never
-        # competes with the actual conversation below it.
-        if self._toast is not None:
+            # --- transient toast: the most recent log line, which clears on
+            # its own after TOAST_SECONDS (see _advance_locked). Dim so it
+            # never competes with the actual conversation below it.
+            if with_toast and self._toast is not None:
+                rows.append(self._text_row(
+                    box["sep"], self._toast, inner, DIM_RGB, DIM_RGB
+                ))
+
+            # --- transcript / reply / timing
             rows.append(self._text_row(
-                box["sep"], self._toast, inner, DIM_RGB, DIM_RGB
+                box["prompt"], self._heard or "waiting for \"hey jarvis\"",
+                inner, accent if self._heard else DIM_RGB,
+                TEXT_RGB if self._heard else DIM_RGB,
             ))
+            rows.append(self._text_row(
+                box["reply"], self._reply, inner, accent, TEXT_RGB
+            ))
+            if with_timing:
+                rows.append(self._text_row(
+                    " ", self._timing, inner, DIM_RGB, DIM_RGB
+                ))
 
-        # --- transcript / reply / timing
-        rows.append(self._text_row(
-            box["prompt"], self._heard or "waiting for \"hey jarvis\"",
-            inner, accent if self._heard else DIM_RGB,
-            TEXT_RGB if self._heard else DIM_RGB,
-        ))
-        rows.append(self._text_row(
-            box["reply"], self._reply, inner, accent, TEXT_RGB
-        ))
-        rows.append(self._text_row(
-            " ", self._timing, inner, DIM_RGB, DIM_RGB
-        ))
+            # --- prompt
+            if self._input_enabled:
+                rows.extend(self._input_rows(inner, accent))
 
-        # --- prompt
-        if self._input_enabled:
-            rows.extend(self._input_rows(inner, accent))
+            rows.append(
+                border + box["bl"] + box["h"] * (inner + 2) + box["br"] + reset
+            )
+            return rows
 
-        rows.append(
-            border + box["bl"] + box["h"] * (inner + 2) + box["br"] + reset
-        )
+        # Build the fullest panel that still fits. The toast is transient
+        # window dressing -- dropping it beats dropping the whole dashboard --
+        # and the timing line is the next least essential row on a short
+        # terminal.
+        rows = build(with_toast=True, with_timing=True)
+        if len(rows) > budget:
+            rows = build(with_toast=False, with_timing=True)
+        if len(rows) > budget:
+            rows = build(with_toast=False, with_timing=False)
 
         # A panel taller than the terminal cannot be drawn with relative
         # cursor moves -- the top rows scroll off, the cursor-up count
-        # overshoots into scrollback, and the panel shreds itself. Two rows
-        # spare so log output still has somewhere to land.
-        if len(rows) + 2 > self._terminal_size()[1]:
+        # overshoots into scrollback, and the panel shreds itself. This is
+        # now only reachable on a genuinely tiny window (the header plus the
+        # bare minimum is roughly eight rows), not from a toast.
+        if len(rows) > budget:
             return None
 
         return "\n".join(rows)
@@ -983,7 +1032,7 @@ class Dashboard(object):
 
     def _kv_line(self, label, value):
         """One label/value row for the info column -- dim label, then the
-        accent-green value, mirroring the mockup's "STT  gemini" styling."""
+        accent-green value, mirroring the mockup's "STT  moonshine" styling."""
         painted = (
             _fg(DIM_RGB) + label + "\x1b[0m"
             + _fg(STATS_RGB) + value + "\x1b[0m"
@@ -1244,7 +1293,7 @@ if __name__ == "__main__":
     try:
         enable_input(True)
         set_state(LISTENING)
-        set_engine("gemini", "groq · cloud")
+        set_engine("moonshine", "moonshine")
         set_turns(14)
         set_latency("1.4s")
         log("demo: JARVIS UI preview -- Ctrl+L = history, Ctrl+C = quit")

@@ -3,12 +3,10 @@
 This is the deliberate opposite of the old file. The previous version had a
 WSOLA time-stretcher, a speed governor, a learned prebuffer, jitter margins,
 a reactive "dry buffer" recovery net and half a dozen tuning knobs all trying
-to smooth over gaps in network TTS streams. That machinery exists because Groq
-delivers audio at roughly real-time over a socket and the player used to bleed
-its buffer dry mid-reply.
+to smooth over gaps in network TTS streams.
 
-Jarvis now talks with the Moonshine local voice first (listener/tts_moonshine),
-which synthesises whole sentences locally before handing them over -- there is
+Jarvis talks with the Moonshine local voice (listener/tts_moonshine), which
+synthesises whole sentences locally before handing them over -- there is
 nothing to smooth, so none of that should touch the samples. Whatever the TTS
 produces is what the speakers play: one queue, one device stream, no
 time-stretch, no speed control, no prebuffer tuning.

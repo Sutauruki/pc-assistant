@@ -1,18 +1,12 @@
 """Local, fully offline TTS using the Moonshine C API (Kokoro/Piper voices).
 
-WHY A SECOND LOCAL TIER
------------------------
-listener/tts_local.py (Kokoro-ONNX) is the classic offline fallback. Moonshine
-ships the same Kokoro voices plus Piper and ZipVoice through its own portable
-C core -- one shared native binary, one asset cache, GPU-free -- which makes it
-a natural primary for JARVIS_TTS_LOCAL_FIRST=1 while Kokoro-ONNX remains the
-deeper fallback.
-
-PLACEMENT
----------
-By default it replaces nothing. When JARVIS_TTS_LOCAL_FIRST=1, listener/tts.py
-tries THIS module first (Moonshine -> Kokoro-ONNX -> cloud), matching the
-JARVIS_STT_LOCAL_FIRST pattern on the STT side.
+WHY THIS IS THE ONLY VOICE
+--------------------------
+The cloud (Groq/Orpheus) and second local (Kokoro-ONNX) tiers are gone.
+Moonshine speaks through its own portable C core -- one shared native binary,
+one asset cache, GPU-free -- which makes it the primary and only voice.
+listener/tts.py still exists as the public facade main.py calls; it hands
+everything here.
 
 THE VOICE
 ---------
@@ -29,6 +23,7 @@ machinery -- the audio that reaches the speakers is exactly what the model
 produced.
 """
 
+import contextlib
 import os
 import queue
 import threading
@@ -45,12 +40,36 @@ from listener.audio_out import StreamingPlayer
 
 DEFAULT_LANGUAGE = "en-us"
 
-VOICE = os.getenv("MOONSHINE_VOICE", "kokoro_af_sky")
+# Pinned voice -- one and only one. The Moonshine native core carries a
+# built-in default ('af_heart') and prints a fallback warning whenever its own
+# catalog queries run without a voice option; pinning the id here means that
+# warning is the only thing left, and the voice never changes.
+VOICE = os.getenv("MOONSHINE_VOICE", "kokoro_af_bella")
 
 _tts = None
 _tts_lock = threading.Lock()
 
 _DONE = object()
+
+
+@contextlib.contextmanager
+def _silence_native_stderr():
+    """Redirects the process's real stderr (fd 2) around a native call.
+
+    The moonshine C core writes its voice-selection warning straight to file
+    descriptor 2, past Python's sys.stderr, so redirecting sys.stderr does
+    nothing. `load()` runs under _tts_lock -- one thread at a time -- which
+    makes a raw fd swap safe for the duration of the call.
+    """
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    saved = os.dup(2)
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        os.close(devnull)
 
 
 def available():
@@ -75,7 +94,12 @@ def load_model():
 
         print("tts_moonshine: loading Moonshine TTS ({})...".format(VOICE))
         _tts = TextToSpeech().language(DEFAULT_LANGUAGE).voice(VOICE)
-        _tts.load()
+        with _silence_native_stderr():
+            # load() runs the library's own voice-catalog validation, which
+            # queries the core without a voice and makes it print its
+            # af_heart fallback warning. Harmless -- the id above is what is
+            # actually used -- but the terminal doesn't need it twice per boot.
+            _tts.load()
         print("tts_moonshine: ready")
         return _tts
 
@@ -132,7 +156,7 @@ def _to_pcm16(samples):
 
 
 def speak(text, on_first_audio=None):
-    """Synthesizes and plays text offline. Mirrors tts_local.speak()'s
+    """Synthesizes and plays text offline. Mirrors tts.speak()'s
     interface: returns the StreamingPlayer, or None when nothing could be
     produced.
 

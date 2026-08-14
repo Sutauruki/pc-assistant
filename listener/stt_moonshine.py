@@ -1,25 +1,13 @@
-"""Local ear: Moonshine STT, an entirely offline transcription tier.
+"""Local ear: Moonshine STT, the only transcription tier.
 
 Goes in: listener/stt_moonshine.py   (new file)
 
-WHY A SECOND LOCAL TIER
------------------------
-Vosk (listener/stt_local.py) uses a 26-word command grammar, which is exactly
-right for the wake-word era of this project and exactly wrong for a full
-conversation -- "where is chrome located on my system" survives contact with
-the cloud tiers, but vanishes to the one word of it Vosk knows when the router
-is unplugged. Moonshine is a real open-vocabulary STT model that runs on the
-CPU, no network, no key, no per-minute budget. That makes it the tier that
-still works with the router unplugged *and* hears a normal sentence.
-
-PLACEMENT
----------
-By default it replaces nothing: Gemini -> OpenRouter -> Vosk stays the chain,
-and Moonshine comes in as a local fallback only when JARVIS_STT_LOCAL_FIRST=1,
-which puts it FIRST -- local, private, no rate limit -- and demotes the cloud
-tiers to backups. Setting that env var in .env is the whole switch:
-
-    JARVIS_STT_LOCAL_FIRST=1
+WHY THIS IS THE ONLY TIER
+-------------------------
+Gemini, OpenRouter and Vosk are gone. Moonshine is a real open-vocabulary
+model that runs on the CPU, no network, no key, no per-minute budget -- which
+makes it the tier that still works with the router unplugged *and* hears a
+normal sentence. Nothing spoken here has to leave the machine.
 
 THE MODEL
 ---------
