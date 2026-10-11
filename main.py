@@ -59,6 +59,7 @@ from listener.record import record_until_silence
 from listener import console_input
 from listener import cues
 from listener import stt_moonshine
+from listener import tts_fish
 from listener import tts_moonshine
 from listener import tts
 from listener import ui
@@ -402,11 +403,12 @@ class _Voice:
             t0 = time.perf_counter()
             try:
                 tts.speak(spoken, on_first_audio=self._on_first_audio)
-                devlog.tts("moonshine", "speak", "OK",
+                ui.set_engine(tts=tts.last_engine())
+                devlog.tts(tts.last_engine(), "speak", "OK",
                            detail=spoken, seconds=time.perf_counter() - t0)
             except Exception as e:
                 print("speech failed: {}".format(e))
-                devlog.tts("moonshine", "speak", "FAIL",
+                devlog.tts(tts.last_engine(), "speak", "FAIL",
                            detail="{}: {}".format(e, spoken),
                            seconds=time.perf_counter() - t0)
 
@@ -448,7 +450,8 @@ class _Voice:
         self._text = str(text or "")
         logbook.jarvis(self._text)
         if self._text.strip():
-            devlog.tts("moonshine", "speak", "OK",
+            ui.set_engine(tts=tts.last_engine())
+            devlog.tts(tts.last_engine(), "speak", "OK",
                        detail=self._text, seconds=time.perf_counter() - t_s0)
         return self._text
 
@@ -1239,10 +1242,11 @@ def main():
     get_output_stream()  # open the speaker up front so the first reply isn't slow
     cues.warm()  # render the earcons now, not while you're waiting to talk
     chat.warm()  # fetch the free-model list on a thread, off the first question
-    # Loading the Moonshine synthesizer takes several seconds on first use --
-    # if it isn't warmed, the first reply pays that latency on top of the
-    # reply itself. Warm it on a thread during startup instead.
-    tts_moonshine.warm()
+    # Open Fish Audio's connection, and load the Moonshine synthesizer (the
+    # offline fallback), on threads during startup. Moonshine takes several
+    # seconds on first use -- unwarmed, a fallback reply would pay that on
+    # top of the reply itself.
+    tts.warm()
 
     # Read the preferences file now rather than on the first turn that needs
     # it. It's a few hundred bytes, and doing it here means the "loaded N
@@ -1261,10 +1265,15 @@ def main():
                detail="available={} compression={}".format(
                    stt_moonshine.available(),
                    os.getenv("MOONSHINE_COMPRESSION", "medium_streaming")))
+    devlog.tts("fish", "setup", "INFO",
+               detail="available={} model={} voice={}".format(
+                   tts_fish.available(), tts_fish.MODEL,
+                   tts_fish.VOICE_ID or "default"))
     devlog.tts("moonshine", "setup", "INFO",
                detail="available={} voice={}".format(
-                   tts_moonshine.available(), os.getenv("MOONSHINE_VOICE", "kokoro_af_sky")))
+                   tts_moonshine.available(), tts_moonshine.VOICE))
 
+    ui.set_engine(tts=tts.primary_engine())
     ui.start()  # no-op when stdout isn't a terminal, or JARVIS_NO_UI is set
 
     # After ui.start(), because it draws the prompt row through the panel.

@@ -14,9 +14,11 @@ history, notifications and an action-confirmation protocol.
   `chat`, or `both`. Chat-only turns are answered without touching the action
   engine; `both` runs the action and feeds its real output back to the brain.
 - **24 command modules** — see table below.
-- **TTS** — Moonshine's local voices (Kokoro/Piper, via its C core), played
-  straight through with no time-stretch, with overlap: the reply starts while
-  actions are still running.
+- **TTS** — Fish Audio's S2.1 Pro cloud voice (free `s2.1-pro-free` tier,
+  streamed as raw PCM), falling back to Moonshine's offline voices
+  (Kokoro/Piper, via its C core) when there's no key, no network, or Fish
+  refuses. Played straight through with no time-stretch, with overlap: the
+  reply starts while actions are still running.
 - **Screen understanding** — grabs the screen, downscales to 640×360 JPEG
   quality 55, and answers "what's on my screen" / "what does that error say" via
   Gemini Vision (`commands/screen_actions.py`).
@@ -65,7 +67,10 @@ No manual download step.
 | Variable | Used by | Required |
 |---|---|---|
 | `MOONSHINE_COMPRESSION` | Moonshine STT model size (`listener/stt_moonshine.py`); default `medium_streaming` | optional |
-| `MOONSHINE_VOICE` | Moonshine TTS voice (`listener/tts_moonshine.py`); default `kokoro_af_sky` | optional |
+| `FISH_API_KEY` | primary TTS voice, Fish Audio S2.1 Pro (`listener/tts_fish.py`); without it Moonshine speaks | recommended |
+| `FISH_VOICE_ID` | Fish Audio voice model id (`reference_id`); unset uses Fish's default voice | optional |
+| `FISH_MODEL` | Fish Audio model header; default `s2.1-pro-free` (free tier), `s2.1-pro` for paid | optional |
+| `MOONSHINE_VOICE` | fallback Moonshine TTS voice (`listener/tts_moonshine.py`); default `kokoro_af_bella` | optional |
 | `GEMINI_API_KEY` | screen understanding (`commands/screen_actions.py`) + all Tier 6 content generation and summarising (`commands/genbrain.py`) | only if those features are used |
 | `OPENROUTER_API_KEY` | chat brain (`commands/chat.py:184`) | for conversational chat |
 | `GROQ_API_KEY` | parser brain (`commands/parser.py:388`) | for command routing |
@@ -122,7 +127,7 @@ No manual download step.
 
 Wake or typed input → `record_until_silence` (16 kHz) → Moonshine STT (fully
 offline) → `parse_command` routes `command` / `chat` / `both` →
-`execute_actions` on a worker thread → reply via Moonshine TTS → the
+`execute_actions` on a worker thread → reply via Fish Audio TTS (Moonshine fallback) → the
 UI ring/status updates per state (`LISTENING` / `THINKING` / `SPEAKING`).
 
 *One player per turn*: every path speaks through a single `_Voice` handle that

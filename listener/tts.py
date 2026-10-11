@@ -1,30 +1,58 @@
-"""TTS facade: everything speaks through Moonshine.
+"""TTS facade: Fish Audio first, Moonshine as the offline fallback.
 
-Goes in: listener/tts.py   (replaces the multi-tier version)
+Goes in: listener/tts.py
 
-This module used to chain cloud (Groq/Orpheus) and two local voices
-(Moonshine, then Kokoro-ONNX) with a fallback order. The other voices are
-gone -- Moonshine is the only voice now -- and this file is what remains: a
-stable public surface for the rest of the codebase (main.py calls tts.speak /
-tts.SentenceFeeder / tts.speak_stream) that hands everything to
-listener/tts_moonshine.py.
+A stable public surface for the rest of the codebase (main.py calls
+tts.speak / tts.SentenceFeeder / tts.speak_stream). Every reply is tried on
+Fish Audio's free S2.1 Pro cloud voice (listener/tts_fish.py) first; if that
+produces no audio at all -- no FISH_API_KEY, no network, rate limited, free
+tier over -- the same text is spoken by the local Moonshine voice
+(listener/tts_moonshine.py). last_engine() says which one actually spoke, for
+the dev log and the UI.
 
 speak_stream() keeps its name and shape for the streaming path in main.py's
-_Voice, but Moonshine synthesises complete text rather than a live feed, so
-the `pieces` iterator is drained into one reply and spoken as a single
-coalesced call. That is the same behaviour the old local-first path had.
+_Voice. The `pieces` iterator is drained into one reply and spoken as a
+single call: one request (or one Moonshine pass) per reply avoids a dead gap
+between sentences, the same behaviour the old local-first path had.
 """
 
 import queue
 import threading
 
-from listener import tts_moonshine
+from listener import tts_fish, tts_moonshine
 
 _DONE = object()
 
+_last_engine = "fish" if tts_fish.available() else "moonshine"
+
+
+def primary_engine():
+    """The engine the next reply will try first."""
+    return "fish" if tts_fish.available() else "moonshine"
+
+
+def last_engine():
+    """The engine that spoke the most recent reply."""
+    return _last_engine
+
+
+def warm():
+    """Pre-warms both voices: Fish's connection, and Moonshine's model so a
+    fallback doesn't pay several seconds of load on top of the reply."""
+    tts_fish.warm()
+    tts_moonshine.warm()
+
 
 def speak(text, on_first_audio=None):
-    """Speak `text` through Moonshine. Returns the player, or None."""
+    """Speak `text`: Fish Audio first, Moonshine if Fish produced nothing.
+    Returns the player, or None."""
+    global _last_engine
+    if tts_fish.available():
+        player = tts_fish.speak(text, on_first_audio=on_first_audio)
+        if player is not None:
+            _last_engine = "fish"
+            return player
+    _last_engine = "moonshine"
     return tts_moonshine.speak(text, on_first_audio=on_first_audio)
 
 
@@ -33,14 +61,14 @@ def speak_stream(pieces, on_first_audio=None, expected_chars=None):
 
     `pieces` is any iterable of strings -- typically a SentenceFeeder fed by
     commands/chat.py's on_sentence callback. All of it is drained into one
-    reply before Moonshine synthesises the whole thing.
+    reply before it is synthesised as a whole.
     """
     if pieces is None:
         return None
     text = " ".join(str(p) for p in pieces if p)
     if not text.strip():
         return None
-    return tts_moonshine.speak(text, on_first_audio=on_first_audio)
+    return speak(text, on_first_audio=on_first_audio)
 
 
 def speak_async(text, on_first_audio=None):
