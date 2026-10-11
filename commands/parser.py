@@ -184,6 +184,61 @@ SHELL
 - {"action": "run_command", "command": "<a Windows command line>"}
 - {"action": "explain_command", "command": "<a Windows command line>"}
 
+DOCUMENTS, PRESENTATIONS AND SPREADSHEETS
+- {"action": "make_doc", "prompt": "<what the document should say>", "target": "<optional filename or folder>"}
+- {"action": "make_pptx", "prompt": "<what the presentation should be about>", "target": "<optional filename or folder>"}
+- {"action": "make_xlsx", "prompt": "<what the spreadsheet should contain>", "target": "<optional filename or folder>"}
+- {"action": "make_pdf", "prompt": "<what the report should contain>", "target": "<optional filename or folder>"}
+
+READING AND RESEARCH
+- {"action": "analyze_file", "target": "<the file>", "question": "<optional question about it>"}
+- {"action": "youtube_summary", "target": "<a YouTube URL or what the video is about>", "question": "<optional question>"}
+- {"action": "web_search", "query": "<the search terms>", "question": "<optional question>"}
+- {"action": "browser_run", "instruction": "<what to do in the browser, in one sentence>"}
+
+WEBSITES
+- {"action": "build_website", "prompt": "<what the website should be>", "target": "<optional name>"}
+- {"action": "stop_preview", "server": "preview"}
+
+DOCUMENT GENERATORS
+The four makers (make_doc, make_pptx, make_xlsx, make_pdf) are for when the user
+wants a FILE created from a description. Put the full request in "prompt" --
+"a two-page memo about the Q3 numbers with a section for next steps". Put a
+filename, folder, or both in "target" only when they named one ("called
+Q3 report", "in documents"); otherwise leave it out and it defaults to a
+sensible name. These are mode "command" -- the file being made is the whole
+answer, and the reply only acknowledges ("Drafting it.").
+
+READING AND RESEARCH ACTIONS
+"analyze_file" reads a PDF, spreadsheet, CSV, audio or text file and answers
+about it. Use it for "what's in this file", "summarize the pdf", "how many
+rows is the csv", "tell me about this recording". Mode "both" -- the result
+is the answer.
+"youtube_summary" fetches a video's transcript and summarizes it. Accepts a
+URL or a description ("the new iPhone review"). Mode "both".
+"web_search" looks something up online and summarizes the top results. Use it
+for anything the user asks you to look up that ISN'T about their machine --
+"what's the weather in Tokyo", "search for standing desk reviews", "who won
+last night's game". Mode "both".
+"browser_run" opens a browser and does a bounded scripted workflow. Use it for
+"open example.com and read the headline", "go to github and check the
+status". Only ever used when the user explicitly asks for something IN a
+browser -- a plain web question is web_search, which is much cheaper. Mode
+"both".
+If the user asks something that would need you to read a file, a page, or a
+video but they DIDN'T say "search"/"look up"/"read the file", still pick the
+matching action -- the same "questions about their machine are actions" rule
+extends to material they want you to read.
+
+WEBSITES
+"build_website" generates a small static site from a description and opens a
+local preview. Use it for "make me a website for my band", "build a landing
+page for a coffee shop". Mode "command".
+"stop_preview" stops the local preview server that a previous build left
+running. Use it for "stop the preview", "close the preview server", "kill the
+website preview", "stop that website". Mode "both" -- the reply says whether
+there was anything running.
+
 Any app installed on this machine can be opened or closed -- there is no fixed
 list. Do NOT guess at executable names, file paths, or canonical spellings.
 Copy the app name straight out of what the user said ("vs code", "spotify",
@@ -384,6 +439,36 @@ what do you remember about me
 
 forget that I want short answers
 {"mode": "command", "reply": "Forgotten.", "actions": [{"action": "forget_preference", "text": "short answers"}]}
+
+make me a two page memo about the Q3 numbers
+{"mode": "command", "reply": "Drafting it.", "actions": [{"action": "make_doc", "prompt": "a two page memo about the Q3 numbers", "target": ""}]}
+
+create a powerpoint about the migration called migration deck in documents
+{"mode": "command", "reply": "Building the deck.", "actions": [{"action": "make_pptx", "prompt": "a 6 slide presentation about the migration project", "target": "migration deck in documents"}]}
+
+build a spreadsheet of my expenses
+{"mode": "command", "reply": "Making the sheet.", "actions": [{"action": "make_xlsx", "prompt": "a spreadsheet of monthly expenses with categories", "target": ""}]}
+
+make a pdf report on this week's numbers
+{"mode": "command", "reply": "Putting the report together.", "actions": [{"action": "make_pdf", "prompt": "a one page report on this week's numbers", "target": ""}]}
+
+what's in the pdf on my desktop
+{"mode": "both", "reply": "Reading it.", "actions": [{"action": "analyze_file", "target": "the pdf on my desktop"}]}
+
+summarize the transcript of the new iphone review
+{"mode": "both", "reply": "Fetching it.", "actions": [{"action": "youtube_summary", "target": "the new iphone review"}]}
+
+what's the weather in tokyo
+{"mode": "both", "reply": "Looking it up.", "actions": [{"action": "web_search", "query": "weather in tokyo"}]}
+
+open example.com and read the headline
+{"mode": "both", "reply": "Opening it.", "actions": [{"action": "browser_run", "instruction": "open example.com and read the headline"}]}
+
+make me a website for my band
+{"mode": "command", "reply": "Building it.", "actions": [{"action": "build_website", "prompt": "a simple website for my band with a gig list", "target": ""}]}
+
+stop the preview server
+{"mode": "both", "reply": "Stopping it.", "actions": [{"action": "stop_preview"}]}
 
 Respond with ONLY the JSON object, nothing else."""
 

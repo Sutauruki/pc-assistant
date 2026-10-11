@@ -375,6 +375,47 @@ def check(path, op="write"):
     return path
 
 
+# --- New-file destinations -------------------------------------------------
+#
+# The Tier-6 generators (docs, slides, sheets, pdf, website) all create files,
+# so they all need the same two answers: where is this allowed to go, and what
+# name won't clobber an existing file. Grouped here so the safety policy lives
+# in one place instead of being re-derived by half a dozen modules.
+
+def output_path(spec, extension="", create=True):
+    """A write-safe destination Path for a brand-new file.
+
+    `spec` may be a full path, a folder, or a filename. `extension` is appended
+    when the resolved path has no suffix yet -- "called Q3 report" should
+    become "Q3 report.docx", not an extensionless file. When the name already
+    exists a numeric "(2)" suffix is added rather than overwriting, which is
+    the same refusal file_actions.mv makes: an overwrite here is a silent
+    delete, and a document generator must never be that.
+
+    Raises paths.Unsafe when the target is a protected location.
+    """
+    path = Path(spec)
+    if extension and not path.suffix:
+        path = path.with_name(path.name + extension)
+
+    check(path, "write")
+
+    if path.exists():
+        stem, suffix, parent = path.stem, path.suffix, path.parent
+        for n in range(2, 1000):
+            candidate = parent / "{stem} ({n}){suffix}".format(stem=stem, n=n, suffix=suffix)
+            if not candidate.exists():
+                path = candidate
+                break
+
+    if create:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    return path
+
+
 # --- Resolution ------------------------------------------------------------
 
 _DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
