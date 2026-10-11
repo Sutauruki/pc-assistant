@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover - depends on the machine
     _HAVE_PYPERCLIP = False
 
 # How much of the clipboard is spoken before it's summarised instead. Below
-# Orpheus's 200-char cap so a short clipboard reads out whole.
+# the one-call TTS coalescing cap so a short clipboard reads out whole.
 SPEAK_LIMIT = 180
 
 # Guard against pasting something enormous into a log line.

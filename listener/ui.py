@@ -3,8 +3,12 @@
 Goes in: listener/ui.py   (replaces existing)
 
 Draws a fixed panel at the bottom of the terminal -- state, waveform, what was
-heard, what Jarvis said, and a prompt line you can type into -- while ordinary
-log output keeps scrolling above it.
+heard, what Jarvis said, and a prompt line you can type into. Log lines no
+longer scroll above this panel (which used to shove it down the screen and
+shred its borders); instead they are buffered into a history and shown as a
+dim toast for a few seconds before the panel settles back to just the
+conversation. The whole history is available on demand with Ctrl+L (see
+toggle_history(), and Ctrl+L/arrows in listener/console_input.py).
 
 The waveform is driven from two places:
 
@@ -53,6 +57,7 @@ import shutil
 import sys
 import threading
 import time
+from collections import deque
 
 # --- States ----------------------------------------------------------------
 
@@ -81,6 +86,14 @@ _STATE_STYLE = {
 
 FPS = 24
 MAX_WIDTH = 84
+
+# While the panel is idle -- LISTENING with no audio and no log traffic --
+# the ring still animates, so a full 24fps repaint of the console (a slow,
+# synchronous write on Windows) is pure waste for a listener that sits there
+# all day. After IDLE_FRAMES of silence the render loop drops to every Nth
+# frame; the wobble keeps moving, just at a fraction of the CPU cost.
+IDLE_FRAMES = FPS * 2   # 2s of quiet before throttling
+IDLE_SKIP = 4           # repaint once every 4 frames while idle
 
 # Ring size, in terminal columns. Rows are derived from this (see
 # _ring_rows_count) so the shape stays round rather than egg-shaped --
@@ -116,6 +129,23 @@ BORDER_RGB = (70, 78, 92)
 TEXT_RGB = (176, 184, 198)
 DIM_RGB = (108, 116, 132)
 
+# Info column values, ported from the mockup's "5dcaa5" accent -- the same
+# green the STT/TTS/latency/sparkline/turns rows use in the HTML.
+STATS_RGB = (93, 202, 165)
+
+# Number of recent audio levels (in frames) the info column's sparkline
+# shows at the ring's right. Same idea as the mockup's fixed "▁▂▁▃▂" row but
+# live -- it scrolls with whatever the mic/speaker actually produced.
+SPARK_WIDTH = 24
+
+# How long the most recent log line stays visible as a dim toast inside the
+# panel before it settles back to just the conversation. The panel itself
+# never moves -- this is purely an overlay that clears on its own.
+TOAST_SECONDS = 4.0
+
+# Cap on buffered log lines kept for the history overlay (ctrl+L).
+HISTORY_MAX = 200
+
 _SPINNER = "◐◓◑◒"
 _SPINNER_ASCII = "|/-\\"
 
@@ -125,6 +155,12 @@ _SPINNER_ASCII = "|/-\\"
 # makes the ring round instead of egg-shaped.
 _RING_UNICODE = {"top": "▀", "bottom": "▄", "full": "█"}
 _RING_ASCII = {"top": "\"", "bottom": ",", "full": "#"}
+
+# Sparkline glyphs for the info column, with an ASCII fallback for consoles
+# that can't render the unicode half-blocks (paired with _RING_UNICODE via
+# the same capability check in start()).
+_SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
+_SPARK_ASCII = ".+*#@%"
 
 _BOX_UNICODE = {
     "tl": "╭", "tr": "╮", "bl": "╰", "br": "╯",
@@ -286,10 +322,29 @@ class Dashboard(object):
         self._last_level = 0.0
         self._spin = 0
         self._tick = 0
+        self._last_activity = 0
 
         self._heard = ""
         self._reply = ""
         self._timing = ""
+
+        # Info column (the mockup's rows to the right of the ring).
+        self._stt = "moonshine"
+        self._tts = "moonshine"
+        self._latency = "1.4s"
+        self._turns = 0
+        self._t0 = None
+        self._spark = deque(maxlen=SPARK_WIDTH)
+
+        # Log handling. Log lines no longer print above the panel and shove
+        # it down the screen; they are buffered into _history and shown as a
+        # transient toast that clears on its own, with a full-history overlay
+        # available on demand (see toggle_history / history_scroll).
+        self._history = deque(maxlen=HISTORY_MAX)
+        self._toast = None
+        self._toast_until = 0
+        self._history_on = False
+        self._history_scroll = 0
 
         # Prompt row. Off until console_input says it has a reader running --
         # showing a prompt you cannot type into would be a lie.
@@ -349,6 +404,7 @@ class Dashboard(object):
 
             self._active = True
             self._stop.clear()
+            self._t0 = time.time()
             self._out = stream          # whatever's really attached, not __stdout__
             self._proxy = _StreamProxy(self, stream)
             sys.stdout = self._proxy
@@ -425,6 +481,7 @@ class Dashboard(object):
         with self._lock:
             if state != self._state:
                 self._state = state
+                self._last_activity = self._tick
                 # Drop levels captured under the previous state -- a peak left
                 # over from the mic shouldn't open the playback wave, and a
                 # delayed playback level shouldn't land after we've gone back
@@ -454,6 +511,20 @@ class Dashboard(object):
         slot = min(int(round(delay * FPS)), MAX_DELAY_FRAMES) if delay > 0 else 0
 
         with self._level_lock:
+            # A real signal keeps the render loop at full rate. The mic
+            # pushes near-zero RMS a dozen times a second even in a silent
+            # room -- that must NOT count as activity, or the idle throttle
+            # would never engage and 24/7 listening would repaint at full
+            # FPS forever.
+            #
+            # No `_lock` here, even though the render thread reads
+            # _last_activity under it: this method runs on the thread
+            # feeding the sound card and must never block on the console
+            # write (see the note in __init__). A plain int store is atomic
+            # under the GIL, and a one-tick lag in the throttle is harmless.
+            if level > 0.01:
+                self._last_activity = self._tick
+
             if slot <= 0:
                 if self._pending is None or level > self._pending:
                     self._pending = level
@@ -484,6 +555,62 @@ class Dashboard(object):
         with self._lock:
             self._timing = (text or "").strip()
 
+    def set_engine(self, stt=None, tts=None):
+        """Info column: the STT and TTS backend labels the mockup shows as
+        "moonshine" and "moonshine"."""
+        if stt is None and tts is None:
+            return
+        with self._lock:
+            if stt is not None:
+                self._stt = stt
+            if tts is not None:
+                self._tts = tts
+
+    def set_latency(self, text):
+        with self._lock:
+            if text:
+                self._latency = (text or "").strip()
+
+    def set_turns(self, count):
+        with self._lock:
+            self._turns = int(count or 0)
+
+    # --- history overlay ---------------------------------------------------
+
+    def toggle_history(self):
+        """Toggles the full-log overlay (the history of everything that
+        would once have scrolled above the panel). On entry the view is
+        reset to the newest lines."""
+        with self._lock:
+            self._history_on = not self._history_on
+            if self._history_on:
+                self._history_scroll = 0
+            self._last_frame = None
+
+    def history_active(self):
+        return self._history_on
+
+    def history_room(self):
+        """Rows available for the history list, roughly. Used to clamp the
+        scroll offset; the render itself lets the existing too-tall check
+        bail out rather than corrupting the cursor arithmetic."""
+        return max(1, self._terminal_size()[1] - 5)
+
+    def history_scroll(self, delta):
+        """Scrolls the history overlay by `delta` (negative = up/older).
+        Returns True if the overlay is still up, so the key reader knows
+        whether to keep swallowing navigation keys."""
+        with self._lock:
+            if not self._history_on:
+                return False
+            count = len(self._history)
+            top = max(0, count - self.history_room())
+            self._history_scroll = max(
+                0, min(top, self._history_scroll + int(delta))
+            )
+            self._last_frame = None
+            return True
+
     def enable_input(self, enabled=True, hint=None):
         """Shows or hides the prompt row. console_input calls this once it
         knows it actually has a keystroke reader."""
@@ -501,21 +628,27 @@ class Dashboard(object):
             self._input = text or ""
 
     def log(self, line):
-        """Prints above the panel."""
+        """A log line. Kept out of the way instead of printing above the
+        panel and shoving it down the screen (the old behaviour, which is
+        what made the dashboard wander and shred).
+
+        When the panel is live, the line goes into the history buffer and
+        shows as a dim toast for TOAST_SECONDS, then settles back. The
+        full history is available on demand -- see toggle_history(). When
+        the UI isn't running (piped, JARVIS_NO_UI) there's no panel to
+        protect, so it prints normally as plain stdout.
+        """
         with self._lock:
             if not self._active:
                 self._write(line + "\n")
                 return
 
-            out = []
-            if self._lines_drawn:
-                out.append("\x1b[{}A".format(self._lines_drawn))
-            out.append("\x1b[J")            # wipe panel and everything below
-            out.append(line + "\n")
-            self._lines_drawn = 0
-            self._last_frame = None         # force a full repaint
-            self._write("".join(out))
-            self._draw_locked()
+            self._history.append(line)
+            # Each new line refreshes the window, so a burst of diagnostics
+            # reads as one continuous status line rather than a flashing row.
+            self._toast = line
+            self._toast_until = self._tick + int(TOAST_SECONDS * FPS)
+            self._last_frame = None
 
     # --- rendering ---------------------------------------------------------
 
@@ -525,7 +658,9 @@ class Dashboard(object):
             try:
                 with self._lock:
                     self._advance_locked()
-                    self._draw_locked()
+                    idle = (self._tick - self._last_activity) > IDLE_FRAMES
+                    if not idle or self._tick % IDLE_SKIP == 0:
+                        self._draw_locked()
             except Exception:
                 # A render bug must never be the thing that kills the
                 # assistant. Drop the frame and try again next tick.
@@ -569,7 +704,13 @@ class Dashboard(object):
                 level = 0.0
 
         self._last_level = level
+        self._spark.append(level)
         self._spin = (self._spin + 1) % (len(self._spinner) * 4)
+
+        # Let a stale toast fade back to just the conversation.
+        if self._toast is not None and self._tick >= self._toast_until:
+            self._toast = None
+            self._last_frame = None
 
     def _ring_cols(self):
         """Ring width in terminal columns, scaled with the panel like the
@@ -658,7 +799,23 @@ class Dashboard(object):
         border = _fg(BORDER_RGB)
         reset = "\x1b[0m"
 
-        rows = []
+        # Rows the terminal can hold, minus two spare so a transient extra
+        # row -- the toast, a state change, an input line -- can't push the
+        # panel into the "too tall, draw nothing" path and make the whole UI
+        # vanish until whatever added the row goes away.
+        budget = self._terminal_size()[1] - 2
+
+        if self._history_on:
+            rows = self._history_rows(box, inner, border, reset, accent)
+            if len(rows) > budget:
+                # History overlay too tall for the terminal: fall back to the
+                # live panel rather than blanking the screen.
+                self._history_on = False
+                try:
+                    return self._frame_locked()
+                finally:
+                    self._history_on = True
+            return "\n".join(rows)
 
         # --- header: ╭─ JARVIS ────────── ● SPEAKING ─╮
         marker = box["dot"]
@@ -674,57 +831,116 @@ class Dashboard(object):
         # header spends 8 on borders and padding; fill takes up the slack.
         fill = max(1, (inner + 4) - 8 - len(title) - len(status))
 
-        rows.append(
+        def build(with_toast, with_timing):
+            rows = [
+                border + box["tl"] + box["h"] + " " + reset
+                + _fg(TEXT_RGB) + title + reset
+                + " " + border + box["h"] * fill + " " + reset
+                + _fg(accent) + status + reset
+                + border + " " + box["h"] + box["tr"] + reset,
+            ]
+
+            # --- ring + info column
+            # Derived from `inner` rather than re-measuring the terminal, same
+            # reasoning as the old wave: a resize between the two reads would
+            # put the ring and the borders on different widths for a frame.
+            # The ring sits left, the mockup's STT/TTS/latency/sparkline/turns
+            # stats sit to its right.
+            ring_cols = self._ring_cols()
+            rows.extend(self._ring_info_rows(ring_cols, accent, inner))
+
+            rows.append(
+                border + box["ml"] + box["h"] * (inner + 2) + box["mr"] + reset
+            )
+
+            # --- transient toast: the most recent log line, which clears on
+            # its own after TOAST_SECONDS (see _advance_locked). Dim so it
+            # never competes with the actual conversation below it.
+            if with_toast and self._toast is not None:
+                rows.append(self._text_row(
+                    box["sep"], self._toast, inner, DIM_RGB, DIM_RGB
+                ))
+
+            # --- transcript / reply / timing
+            rows.append(self._text_row(
+                box["prompt"], self._heard or "waiting for \"hey jarvis\"",
+                inner, accent if self._heard else DIM_RGB,
+                TEXT_RGB if self._heard else DIM_RGB,
+            ))
+            rows.append(self._text_row(
+                box["reply"], self._reply, inner, accent, TEXT_RGB
+            ))
+            if with_timing:
+                rows.append(self._text_row(
+                    " ", self._timing, inner, DIM_RGB, DIM_RGB
+                ))
+
+            # --- prompt
+            if self._input_enabled:
+                rows.extend(self._input_rows(inner, accent))
+
+            rows.append(
+                border + box["bl"] + box["h"] * (inner + 2) + box["br"] + reset
+            )
+            return rows
+
+        # Build the fullest panel that still fits. The toast is transient
+        # window dressing -- dropping it beats dropping the whole dashboard --
+        # and the timing line is the next least essential row on a short
+        # terminal.
+        rows = build(with_toast=True, with_timing=True)
+        if len(rows) > budget:
+            rows = build(with_toast=False, with_timing=True)
+        if len(rows) > budget:
+            rows = build(with_toast=False, with_timing=False)
+
+        # A panel taller than the terminal cannot be drawn with relative
+        # cursor moves -- the top rows scroll off, the cursor-up count
+        # overshoots into scrollback, and the panel shreds itself. This is
+        # now only reachable on a genuinely tiny window (the header plus the
+        # bare minimum is roughly eight rows), not from a toast.
+        if len(rows) > budget:
+            return None
+
+        return "\n".join(rows)
+
+    def _history_rows(self, box, inner, border, reset, accent):
+        """The full-log overlay: every line that would once have scrolled
+        above the panel, shown in place of the ring and conversation so it
+        has the whole panel to itself. Opens with ctrl+L, closes the same
+        way (or with Esc); ↑/↓/PageUp/PageDown scroll a window scrolled by
+        history_scroll()."""
+        title = "J A R V I S"
+        status = "  H I S T O R Y  "
+        fill = max(1, (inner + 4) - 8 - len(title) - len(status))
+        rows = [
             border + box["tl"] + box["h"] + " " + reset
             + _fg(TEXT_RGB) + title + reset
             + " " + border + box["h"] * fill + " " + reset
             + _fg(accent) + status + reset
-            + border + " " + box["h"] + box["tr"] + reset
-        )
+            + border + " " + box["h"] + box["tr"] + reset,
+            self._text_row(
+                box["sep"],
+                "ctrl+L close · ↑/↓ or PageUp/PageDown scroll",
+                inner, DIM_RGB, DIM_RGB,
+            ),
+            border + box["ml"] + box["h"] * (inner + 2) + box["mr"] + reset,
+        ]
 
-        # --- ring
-        # Derived from `inner` rather than re-measuring the terminal, same
-        # reasoning as the old wave: a resize between the two reads would
-        # put the ring and the borders on different widths for a frame.
-        ring_cols = self._ring_cols()
-        for row in self._ring_rows(ring_cols, accent):
-            rows.append(
-                self._pad_row(row, ring_cols, inner, border, center=True)
-            )
+        lines = list(self._history)
+        count = len(lines)
+        room = self.history_room()
+        start = max(0, count - max(1, room) - self._history_scroll)
+        for ln in lines[start:]:
+            rows.append(self._text_row(box["sep"], ln, inner, DIM_RGB, TEXT_RGB))
 
-        rows.append(
-            border + box["ml"] + box["h"] * (inner + 2) + box["mr"] + reset
-        )
-
-        # --- transcript / reply / timing
-        rows.append(self._text_row(
-            box["prompt"], self._heard or "waiting for \"hey jarvis\"",
-            inner, accent if self._heard else DIM_RGB,
-            TEXT_RGB if self._heard else DIM_RGB,
-        ))
-        rows.append(self._text_row(
-            box["reply"], self._reply, inner, accent, TEXT_RGB
-        ))
-        rows.append(self._text_row(
-            " ", self._timing, inner, DIM_RGB, DIM_RGB
-        ))
-
-        # --- prompt
         if self._input_enabled:
             rows.extend(self._input_rows(inner, accent))
 
         rows.append(
             border + box["bl"] + box["h"] * (inner + 2) + box["br"] + reset
         )
-
-        # A panel taller than the terminal cannot be drawn with relative
-        # cursor moves -- the top rows scroll off, the cursor-up count
-        # overshoots into scrollback, and the panel shreds itself. Two rows
-        # spare so log output still has somewhere to land.
-        if len(rows) + 2 > self._terminal_size()[1]:
-            return None
-
-        return "\n".join(rows)
+        return rows
 
     def _ring_params(self):
         """Current (t, speed, amp, buzz) for the wobble formula below.
@@ -813,6 +1029,74 @@ class Dashboard(object):
             ]
             out.append("".join(cells))
         return out
+
+    def _kv_line(self, label, value):
+        """One label/value row for the info column -- dim label, then the
+        accent-green value, mirroring the mockup's "STT  moonshine" styling."""
+        painted = (
+            _fg(DIM_RGB) + label + "\x1b[0m"
+            + _fg(STATS_RGB) + value + "\x1b[0m"
+        )
+        return painted, len(label) + len(value)
+
+    def _spark_painted(self):
+        """The mockup's live sparkline, grown from the recent audio levels
+        (self._spark) into a column of ▁…█ blocks, all in the mockup green.
+        Falls back to ASCII bars on consoles that can't show the blocks
+        (same capability check that drives the ring's fallback)."""
+        blocks = _SPARK_BLOCKS if self._ring_chars is _RING_UNICODE else _SPARK_ASCII
+        vals = list(self._spark)
+        if len(vals) < SPARK_WIDTH:
+            vals = [0.0] * (SPARK_WIDTH - len(vals)) + vals
+        vals = vals[-SPARK_WIDTH:]
+        chars = "".join(blocks[min(len(blocks) - 1, int(v * (len(blocks) - 1) + 0.5))] for v in vals)
+        painted = _fg(STATS_RGB) + chars + "\x1b[0m"
+        return painted, len(chars)
+
+    def _info_lines(self, inner):
+        """The five mockup info rows, each as (painted, visible_len)."""
+        uptime = 0
+        if self._t0 is not None:
+            uptime = int(time.time() - self._t0)
+        minutes = uptime // 60
+        up_str = "{}m".format(minutes) if minutes else "{}s".format(uptime)
+
+        lines = [
+            self._kv_line("STT ", self._stt),
+            self._kv_line("TTS ", self._tts),
+            self._kv_line("latency ", self._latency),
+            self._spark_painted(),
+            self._kv_line(
+                "turns {} · up {}".format(self._turns, up_str), ""
+            ),
+        ]
+        # Don't let an info line push past the right edge of the panel.
+        room = inner - len(" ") - len("STT ")
+        for i, (painted, vlen) in enumerate(lines):
+            if vlen > room:
+                lines[i] = (painted, room)
+        return lines
+
+    def _ring_info_rows(self, ring_cols, accent, inner):
+        """The ring on the left with the info column centred vertically to
+        its right -- the mockup's flex layout, one terminal row at a time."""
+        ring_rows = self._ring_rows(ring_cols, accent)
+        info = self._info_lines(inner)
+        gap = 7
+        start = (len(ring_rows) - len(info)) // 2
+        if start < 0:
+            start = 0
+        border = _fg(BORDER_RGB)
+        rows = []
+        for i, ring_row in enumerate(ring_rows):
+            if start <= i < start + len(info):
+                painted, vlen = info[i - start]
+            else:
+                painted, vlen = "", 0
+            combined = ring_row + " " * gap + painted
+            visible = ring_cols + gap + vlen
+            rows.append(self._pad_row(combined, visible, inner, border))
+        return rows
 
     def _pad_row(self, painted, visible_len, inner, border, center=False):
         """Wraps one row of already-coloured content in the panel borders.
@@ -951,6 +1235,30 @@ def set_timing(text):
     _dashboard.set_timing(text)
 
 
+def set_engine(stt=None, tts=None):
+    _dashboard.set_engine(stt=stt, tts=tts)
+
+
+def set_latency(text):
+    _dashboard.set_latency(text)
+
+
+def set_turns(count):
+    _dashboard.set_turns(count)
+
+
+def toggle_history():
+    _dashboard.toggle_history()
+
+
+def history_active():
+    return _dashboard.history_active()
+
+
+def history_scroll(delta):
+    return _dashboard.history_scroll(delta)
+
+
 def enable_input(enabled=True, hint=None):
     _dashboard.enable_input(enabled, hint=hint)
 
@@ -970,16 +1278,25 @@ def is_active():
 
 
 if __name__ == "__main__":
-    # Fake a turn so the panel can be eyeballed without the mic or the API.
+    # Walk the whole API so the panel can be eyeballed without the mic or
+    # the API: every state, the toast behaviour for log lines, the history
+    # overlay (auto-played, then left open for you to scroll), and a live
+    # prompt driven by the real keystroke reader.
     import random
 
     if not start():
         print("dashboard inactive -- not a terminal, or JARVIS_NO_UI is set")
         raise SystemExit(1)
 
+    ci = None
+
     try:
         enable_input(True)
         set_state(LISTENING)
+        set_engine("moonshine", "moonshine")
+        set_turns(14)
+        set_latency("1.4s")
+        log("demo: JARVIS UI preview -- Ctrl+L = history, Ctrl+C = quit")
         for _ in range(int(FPS * 1.5)):
             push_level(random.uniform(0.0, 0.06))
             time.sleep(1.0 / FPS)
@@ -1003,6 +1320,8 @@ if __name__ == "__main__":
 
         set_reply("Sure, opening Spotify and grabbing that screenshot.")
         set_state(SPEAKING)
+        # These prints are captured by the dashboard's stdout proxy and show
+        # up as the dim, self-clearing toast -- not as scrollback.
         print("Opened Spotify")
         print("Screenshot taken")
         for i in range(int(FPS * 3)):
@@ -1015,8 +1334,60 @@ if __name__ == "__main__":
 
         set_state(LISTENING)
         set_timing("stt 1.10s | reply 0.42s | first audio 0.09s")
-        time.sleep(2.0)
+        time.sleep(1.2)
+
+        # Give the history overlay something to browse.
+        for _ in range(5):
+            log("demo: a thing Jarvis did (e.g. opened an app, grabbed output)")
+        log("demo: history now has lines for you to scroll through")
+        time.sleep(1.5)
+
+        # Auto-play the overlay so you can see it open, scroll and close.
+        log("demo: opening history overlay...")
+        time.sleep(1.0)
+        toggle_history()
+        time.sleep(1.2)
+        history_scroll(-2)   # a page up
+        time.sleep(1.2)
+        history_scroll(8)    # back toward the newest
+        time.sleep(1.2)
+        toggle_history()
+        log("demo: overlay closed -- back to the panel")
+        time.sleep(1.0)
+
+        # Hand over to the real keystroke reader so you can drive it: type to
+        # see the prompt, Ctrl+L for history, Ctrl+C to quit.
+        try:
+            import listener.console_input as ci
+        except Exception:
+            ci = None
+        if ci is not None and ci.start():
+            set_input("")
+            set_state(LISTENING)
+            log("demo: live now -- type anything, Ctrl+L = history, Ctrl+C = quit")
+            end = None  # interactive until Ctrl+C
+        else:
+            ci = None
+            log("demo: no key reader here -- will end in 5s (Ctrl+C sooner)")
+            end = time.time() + 5.0
+
+        while True:
+            if ci is not None:
+                line = ci.poll()
+                if line:
+                    set_heard(line)
+                    set_reply('(demo) echoed "{}"'.format(line))
+                    log("demo: submitted: {}".format(line))
+            push_level(random.uniform(0.0, 0.04))
+            if end is not None and time.time() >= end:
+                break
+            time.sleep(1.0 / FPS)
     except KeyboardInterrupt:
         pass
     finally:
+        if ci is not None:
+            try:
+                ci.stop()
+            except Exception:
+                pass
         stop()

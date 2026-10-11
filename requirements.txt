@@ -1,5 +1,58 @@
-openwakeword
-sounddevice
-numpy
-python-dotenv
-piper-tts
+# pc-assistant runtime dependencies
+# Python 3.10+ recommended. Windows is the primary platform.
+
+# --- Core audio / UI plumbing ---
+sounddevice>=0.4.6
+numpy>=1.24
+python-dotenv>=1.0
+comtypes>=1.2
+
+# --- Wake word (openwakeword) ---
+# openwakeword >= 0.5 no longer bundles pretrained models into the wheel.
+# listener/wake_word.py auto-downloads the requested model (e.g. hey_jarvis)
+# from Hugging Face on first load, so no separate download step is needed.
+openwakeword>=0.6.0
+# Windows needs the ONNX inference framework (tflite-runtime has no Windows
+# wheels). wake_word.py pins inference_framework="onnx" on Windows.
+onnxruntime>=1.19
+
+# --- Speech-to-text / text-to-speech ---
+moonshine-voice>=0.1          # offline open-vocabulary STT + Kokoro-style TTS
+google-genai>=2.0             # screen understanding (commands/screen_actions.py)
+groq>=0.9                     # command parser / chat brain
+httpx>=0.27                   # used directly alongside groq
+
+# --- System control & command modules ---
+psutil>=5.9                   # processes / windows / self-guard
+pycaw>=20240210               # volume control (uses comtypes)
+mss>=9.0                      # screenshots
+pillow>=10.0                  # screen-understanding downscale + JPEG encode
+pyperclip>=1.8                # clipboard read/write
+Send2Trash>=1.8               # recycle-bin deletes
+plyer>=2.1                    # app indexing / desktop info
+
+# --- Notifications (optional backends) ---
+# notify.py imports these on a best-effort basis and falls back across them.
+win11toast>=0.14
+windows-toasts
+win10toast
+
+# --- Command parser / chat ---
+requests>=2.31
+
+# --- Tier 6: content & productivity (commands/docs, slides, sheets, pdf,
+# --- file_analysis, youtube_video, web_search, browser_automation,
+# --- website_builder).
+# --- audioop-lts: pydub needs the audioop module that Python 3.13+ removed.
+python-docx>=1.1
+python-pptx>=1.0
+openpyxl>=3.1
+reportlab>=4.0
+PyPDF2>=3.0
+pandas>=2.2
+pydub>=0.25
+audioop-lts>=0.2; python_version >= "3.13"
+youtube-transcript-api>=1.0
+ddgs>=9.0
+beautifulsoup4>=4.12
+playwright>=1.40

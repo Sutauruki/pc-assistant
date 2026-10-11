@@ -43,6 +43,8 @@ interleave.
 """
 
 import os
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -56,16 +58,18 @@ from listener.wake_word import load_wake_word_model, check_wake_word
 from listener.record import record_until_silence
 from listener import console_input
 from listener import cues
-from listener import stt_gemini
-from listener import stt_local
-from listener import stt_openrouter
+from listener import stt_moonshine
+from listener import tts_moonshine
 from listener import tts
 from listener import ui
 from listener.audio_out import get_stream as get_output_stream, close_stream
 from commands import chat
 from commands import cmd_control
 from commands import confirm
+from commands import devlog
+from commands import logbook
 from commands import memory
+from commands import notify
 from commands.parser import parse_command, generate_reply, remember
 from commands.executor import execute_actions
 
@@ -81,8 +85,34 @@ COOLDOWN_SECONDS = 0.4
 # such problem, and waiting 0.4s after pressing Enter just feels broken.
 TYPED_COOLDOWN_SECONDS = 0.0
 
-RECORDINGS_DIR = "recordings"
-SAVE_RECORDINGS = True  # set False to skip disk writes entirely
+def _recordings_dir():
+    """Where clips live: per-user app data, not the project tree.
+
+    A recordings folder next to the code is something a user finds, opens, and
+    worries about. %LOCALAPPDATA%\\Jarvis is where Windows programs put state
+    nobody should need to see, and a voice assistant storing what it hears in
+    a browseable project folder is a bad look on top of being bad practice.
+    Falls back to a local folder when LOCALAPPDATA isn't set (non-Windows).
+    """
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        return os.path.join(base, "Jarvis", "recordings")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
+
+
+RECORDINGS_DIR = _recordings_dir()
+SAVE_RECORDINGS = True  # set False to skip disk writes entirely.
+
+# Recordings exist to be inspected for a few seconds after a turn (did it
+# hear what I think I said?), not for the long haul. Deleting each clip this
+# long after it was written keeps the folder tens of megabytes instead of
+# gigabytes. Anything left over (a crash, a kill -9) is swept on startup.
+RECORDING_RETENTION_SECONDS = 60.0
+
+# Safety net on top of the retention timer: even if a clip can't be deleted
+# (file locked, transient failure), the oldest ones make room. The retention
+# timer is the plan; this is the roof.
+MAX_RETAINED_RECORDINGS = 100
 
 # Speaking and acting at the same time is what removed the dead air -- the
 # reply starts while apps are still launching. Set False to go back to
@@ -105,6 +135,10 @@ SPOKEN_RESULTS = {
     "list_windows", "list_files", "find_file", "where_is",
     "read_clipboard", "run_command", "explain_command",
     "list_memory", "what_do_you_remember", "show_memory",
+    "understand_screen",
+    # Tier 6: the result is the answer, a read that comes back as prose.
+    "analyze_file", "youtube_summary", "web_search", "browser_run",
+    "stop_preview",
 }
 
 # How many times to re-record for an answer to a pending confirmation before
@@ -126,6 +160,12 @@ CONFIRM_TYPED_SECONDS = 8.0
 
 _FAILURE_WORDS = ("failed", "couldn't", "didn't")
 
+# Recover from a vanishing input device (an unplugged headset raises
+# PortAudioError on the next stream.read). These bound how hard _listen_loop
+# tries to bring the mic back before surrendering to typed-only mode.
+MIC_RECONNECT_ATTEMPTS = 10
+MIC_RECONNECT_DELAY = 1.0
+
 def _write_wav(audio, filepath):
     with wave.open(filepath, "wb") as wf:
         wf.setnchannels(1)
@@ -134,64 +174,127 @@ def _write_wav(audio, filepath):
         wf.writeframes(audio.tobytes())
 
 
+def _hide_dir(path):
+    """Best-effort Windows 'hidden' attribute on a directory. Fails silently:
+    a visible recordings folder is an aesthetic issue, not an error."""
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["attrib", "+h", path], check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+
 def save_wav_async(audio):
     """Archives the clip on a background thread. The old code wrote to disk
     *before* transcribing, putting file I/O on the critical path for no
-    reason -- STT works off the in-memory array."""
+    reason -- STT works off the in-memory array. The clip self-deletes after
+    RECORDING_RETENTION_SECONDS, so the folder stays small on its own."""
     if not SAVE_RECORDINGS:
         return
 
     filename = "recording_{}.wav".format(time.strftime("%Y%m%d_%H%M%S"))
+    filepath = os.path.join(RECORDINGS_DIR, filename)
 
     def run():
         try:
             os.makedirs(RECORDINGS_DIR, exist_ok=True)
-            _write_wav(audio, os.path.join(RECORDINGS_DIR, filename))
+            _hide_dir(RECORDINGS_DIR)
+            _write_wav(audio, filepath)
+            time.sleep(RECORDING_RETENTION_SECONDS)
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
         except Exception as e:
             print("Failed to archive recording: {}".format(e))
 
     threading.Thread(target=run, daemon=True).start()
 
 
-def transcribe(audio):
-    """Gemini -> OpenRouter -> Vosk, in that order, first one that answers.
+def sweep_recordings():
+    """Called at startup: clear clips no process will ever delete.
 
-    The middle tier exists because the two ends are further apart than they
-    look. Gemini hears open-ended English; Vosk (listener/stt_local.py) runs a
-    26-word command grammar. So a rate limit or a 502 -- not a broken machine,
-    just a bad few seconds -- used to turn "where is chrome located on my
-    system" into the one word of it Vosk knows. One cloud tier failing should
-    cost accuracy, not vocabulary.
-
-    Vosk stays last on purpose. It is the tier that still works with the router
-    unplugged, and it answers in well under a second, which is what lets the
-    OpenRouter tier keep a hard 12s deadline instead of retrying politely.
+    A clip's deletion is scheduled on the thread that wrote it, so a crash or
+    a force-kill leaves the whole backlog behind. Retention is a guarantee
+    only for a healthy process, and this sweeps the folder back to before the
+    retention window -- and, as a roof, to MAX_RETAINED_RECORDINGS even if
+    timestamps are broken or clock-skewed.
     """
+    if not SAVE_RECORDINGS:
+        return
+    if not os.path.isdir(RECORDINGS_DIR):
+        os.makedirs(RECORDINGS_DIR, exist_ok=True)
+    _hide_dir(RECORDINGS_DIR)
+    if not os.path.isdir(RECORDINGS_DIR):
+        return
+
+    cutoff = time.time() - RECORDING_RETENTION_SECONDS
+    retained = []
     try:
-        text = stt_gemini.transcribe(audio)
-        print('Heard (Gemini): "{}"'.format(text))
-        ui.set_heard(text)
-        return text
+        for name in os.listdir(RECORDINGS_DIR):
+            if not name.endswith(".wav"):
+                continue
+            path = os.path.join(RECORDINGS_DIR, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                os.remove(path)
+                continue
+            if mtime < cutoff:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            else:
+                retained.append((mtime, path))
+
+        retained.sort()
+        while len(retained) > MAX_RETAINED_RECORDINGS:
+            _, old = retained.pop(0)
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    except OSError as e:
+        print("couldn't sweep recordings: {}".format(e))
+
+
+def transcribe(audio):
+    """Moonshine -- the only ear, and a fully offline one.
+
+    Gemini, OpenRouter and Vosk are gone; nothing heard here has to leave the
+    machine. Moonshine is open-vocabulary, so a long free-form question
+    survives contact with the transcript just as well as a one-word command.
+    """
+    if not stt_moonshine.available():
+        devlog.stt("moonshine", "transcribe", "SKIP", detail="not installed")
+        print("Moonshine STT not installed")
+        return ""
+
+    t0 = time.perf_counter()
+    try:
+        text = stt_moonshine.transcribe(audio)
     except Exception as e:
-        print("Gemini STT failed ({}), trying OpenRouter...".format(e))
+        devlog.stt("moonshine", "transcribe", "FAIL",
+                   detail=str(e)[:120], seconds=time.perf_counter() - t0)
+        print("Moonshine STT failed ({}).".format(e))
+        return ""
 
-    # available() covers both "no key configured" and "cooling off after a
-    # failure", so a machine that never set OPENROUTER_STT_API_KEY behaves
-    # exactly as it did before this tier existed.
-    if stt_openrouter.available():
-        try:
-            text = stt_openrouter.transcribe(audio)
-            print('Heard (OpenRouter): "{}"'.format(text))
-            ui.set_heard(text)
-            return text
-        except Exception as e:
-            print("OpenRouter STT failed ({}), falling back to local...".format(e))
+    if text:
+        devlog.stt("moonshine", "transcribe", "OK",
+                   detail="...{}".format(text[-80:]) if len(text) > 80 else text,
+                   seconds=time.perf_counter() - t0)
+        print('Heard (Moonshine): "{}"'.format(text))
+        ui.set_heard(text)
     else:
-        print("OpenRouter STT unavailable, falling back to local...")
-
-    text = stt_local.transcribe(audio)
-    print('Heard (local): "{}"'.format(text))
-    ui.set_heard(text)
+        # Moonshine returned "" (silence detected). "Nothing heard" is a real
+        # answer, not a failure -- _run_turn already knows what to do with it.
+        devlog.stt("moonshine", "transcribe", "SKIP", detail="silence",
+                   seconds=time.perf_counter() - t0)
+        print("Heard (Moonshine): silence")
     return text
 
 
@@ -286,6 +389,7 @@ class _Voice:
         self.wait()
         spoken = str(text)
         self._text = spoken
+        logbook.jarvis(spoken)
 
         def run():
             # speak() swallows its own failures, but it does network I/O on a
@@ -295,10 +399,16 @@ class _Voice:
             # `spoken` rather than self._text: if a previous wait() timed out
             # and this attribute is reassigned underneath a still-running
             # thread, the closure should still say what it was handed.
+            t0 = time.perf_counter()
             try:
                 tts.speak(spoken, on_first_audio=self._on_first_audio)
+                devlog.tts("moonshine", "speak", "OK",
+                           detail=spoken, seconds=time.perf_counter() - t0)
             except Exception as e:
                 print("speech failed: {}".format(e))
+                devlog.tts("moonshine", "speak", "FAIL",
+                           detail="{}: {}".format(e, spoken),
+                           seconds=time.perf_counter() - t0)
 
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
@@ -315,6 +425,7 @@ class _Voice:
         """
         self.wait()
         feeder = tts.SentenceFeeder()
+        t_s0 = time.perf_counter()
 
         def run():
             try:
@@ -335,6 +446,10 @@ class _Voice:
             feeder.close()
 
         self._text = str(text or "")
+        logbook.jarvis(self._text)
+        if self._text.strip():
+            devlog.tts("moonshine", "speak", "OK",
+                       detail=self._text, seconds=time.perf_counter() - t_s0)
         return self._text
 
     def wait(self):
@@ -388,6 +503,43 @@ def _resolve_confirmation(text, voice):
     print("confirm: unrelated reply, dropping the question")
     confirm.clear()
     return False
+
+
+def _answer_from_toast(text):
+    """Resolves a parked confirmation with an answer that came from a toast
+    (a [Yes]/[No] button or text typed into the notification).
+
+    Runs on the toast's background thread, not the wake loop, so it does its
+    own COM initialisation (the parked callable is often a delete) and reports
+    through a fresh voice. It resolves whichever confirmation is pending; the
+    wake loop's own follow-up listener sees is_pending() go false and moves on
+    without double-running the callable, because accept()/reject() pop it under
+    the same lock.
+    """
+    text = (text or "").strip()
+    if not text or not confirm.is_pending():
+        return
+    verdict = confirm.interpret(text)
+
+    comtypes.CoInitialize()
+    try:
+        if verdict is True:
+            result = confirm.accept()
+        elif verdict is False:
+            result = confirm.reject()
+        else:
+            # Neither clearly a yes nor a no (e.g. dismissed or gibberish).
+            # Leave it pending rather than inventing an answer -- it can still
+            # be answered by speaking or typing, and expires on its own.
+            return
+    finally:
+        comtypes.CoUninitialize()
+
+    if result:
+        print(result)
+        ui.set_reply(result)
+        _Voice({}, time.perf_counter()).say(result, background=False)
+        notify.notify("Jarvis", "Done: {}".format(result))
 
 
 def _chat_context(text, actions, results):
@@ -474,6 +626,7 @@ def _finish(marks, t_start):
     marks["spoken"] = time.perf_counter() - t_start
     timing = _format_timing(marks)
     ui.set_timing(timing)
+    devlog.turn("done", detail=timing, seconds=marks["spoken"])
     print("  timing: " + timing)
 
 
@@ -485,6 +638,7 @@ def _run_turn(text, t_start, marks):
     and whether marks["stt"] exists.
     """
     voice = _Voice(marks, t_start)
+    devlog.turn("start", detail="...{}".format(text[-80:]) if len(text) > 80 else text)
 
     # Nothing was said. Stop here, before the parked-question check and before
     # the router.
@@ -496,13 +650,15 @@ def _run_turn(text, t_start, marks):
     # who said nothing, because it throws away a pending delete confirmation
     # and then asks the router to route silence.
     #
-    # This got more likely with the OpenRouter STT tier, which returns "" for
-    # silence on purpose (as distinct from raising, which means the tier
-    # failed and Vosk should try). Gemini and Vosk can both return "" too, so
-    # this was always reachable -- it just needed a clear enough owner to fix.
+    # This got more likely when the STT tier's contract became "return "" for
+    # silence rather than raise" -- an empty transcript is a real answer, not
+    # a failure, and routing it as a turn would ask the router to route
+    # silence.
     if not text or not str(text).strip():
         print("nothing heard")
         return
+
+    logbook.user(text)
 
     # A parked question owns the next thing said, whatever it was going to be.
     if confirm.is_pending():
@@ -514,6 +670,7 @@ def _run_turn(text, t_start, marks):
 
     def on_mode(mode):
         route["mode"] = mode
+        devlog.route("mode", "OK", mode)
         print("route: {}".format(mode))
         # True aborts the parse. Only for pure chat: there are no actions to
         # wait for, so every remaining token of the router's response is
@@ -537,6 +694,10 @@ def _run_turn(text, t_start, marks):
 
     mode, actions, reply = parse_command(text, on_reply=on_reply, on_mode=on_mode)
     marks["parse"] = time.perf_counter() - t_start
+    kinds = [a.get("action") if isinstance(a, dict) else "?" for a in actions]
+    devlog.route("parse", "OK", "mode={} actions={} {}".format(
+        mode, len(actions), kinds
+    ), seconds=marks["parse"])
     print("Mode: {} | actions: {}".format(mode, actions))
 
     if mode == "chat":
@@ -564,6 +725,7 @@ def _run_turn(text, t_start, marks):
             exec_box["results"] = run_actions(immediate)
         except Exception as e:
             exec_box["results"] = ["Failed to run that: {}".format(e)]
+            devlog.exec_event("-", "run", "FAIL", str(e)[:120])
             print("action execution failed: {}".format(e))
             traceback.print_exc()
 
@@ -605,6 +767,21 @@ def _run_turn(text, t_start, marks):
             ui.set_reply(line)
             voice.say(line, background=False)
 
+    # A toast whenever a task actually ran -- the spoken "done" is easy to miss
+    # when you're not looking at the terminal. Pure chat is skipped (the answer
+    # was already spoken), and so are failures (those get their own toast in
+    # the correction branch). When an action parked a confirmation, its result
+    # is the question itself, filtered out here so the toast doesn't read its
+    # own question back.
+    if mode != "chat" and not _failed(unspoken):
+        parked = (confirm.question() or "").strip()
+        done_lines = [
+            str(r).strip() for r in results
+            if str(r).strip() and str(r).strip() != parked
+        ]
+        if done_lines:
+            notify.notify("Done", " ".join(done_lines))
+
     # A parked question is the last word of the turn -- it has to be, since the
     # answer is the next thing the user says.
     if confirm.is_pending():
@@ -612,10 +789,15 @@ def _run_turn(text, t_start, marks):
         print('Jarvis asks: "{}"'.format(question))
         ui.set_reply(question)
         voice.say(question, background=False)
+        # An answerable toast: [Yes]/[No] buttons plus a text box, so the
+        # question can be answered from the notification without speaking or
+        # typing into the terminal. Falls back to a plain toast showing the
+        # question when no interactive backend is installed.
+        notify.confirm("Jarvis", question, _answer_from_toast)
         _finish(marks, t_start)
         return
 
-    # Only pay for a second Groq + TTS round trip if something actually failed
+    # Only pay for a second synthesis + TTS round trip if something actually failed
     # AND the user hasn't already heard it. `run_command` is in SPOKEN_RESULTS,
     # so a failing command's output was just read out verbatim; paraphrasing it
     # here said the same thing twice, several seconds apart. The correction is
@@ -629,6 +811,7 @@ def _run_turn(text, t_start, marks):
         print('Jarvis corrects: "{}"'.format(correction))
         ui.set_reply(correction)
         voice.say(correction, background=False)
+        notify.notify("Heads up", correction)
 
     _finish(marks, t_start)
 
@@ -727,12 +910,13 @@ def handle_typed(text):
     """Typed turn: identical to a spoken one, minus the microphone.
 
     Worth noting how much this skips -- no recording, no silence detection,
-    no Gemini round trip. A typed command reaches the parser roughly two to
+    no STT round trip. A typed command reaches the parser roughly two to
     four seconds sooner than the same words spoken, which is why this is the
     fastest way to test a change.
     """
     t_start = time.perf_counter()
     marks = {}
+    devlog.wake("typed", detail="...{}".format(text[-80:]) if len(text) > 80 else text)
 
     ui.set_state(ui.THINKING)
     print('Typed: "{}"'.format(text))
@@ -954,6 +1138,7 @@ def _voice_loop(model, stream, typing):
         if not check_wake_word(model, data[:, 0]):
             continue
 
+        devlog.wake("detected", detail="hey_jarvis")
         _record_turn(stream)
         _settle(stream, model, typed=False)
         _follow_up(stream, model, typing)
@@ -976,8 +1161,24 @@ def _typed_only_loop():
 
 
 def _listen_loop(model, typing):
+    # Attempts to bring the microphone back after it disappears. Unplugging a
+    # headset makes PortAudio raise on the next stream.read() -- previously
+    # that was a full crash. Instead: close, wait for the device to come back
+    # (Windows re-enumerates a replugged headset), and retry the open. Only
+    # give up to typed-input mode when nothing recovers.
+    def _open_with_retry():
+        last = None
+        for attempt in range(MIC_RECONNECT_ATTEMPTS):
+            try:
+                return _open_input_stream()
+            except Exception as e:
+                last = e
+                if attempt < MIC_RECONNECT_ATTEMPTS - 1:
+                    time.sleep(MIC_RECONNECT_DELAY)
+        raise last
+
     try:
-        stream = _open_input_stream()
+        stream = _open_with_retry()
     except Exception as e:
         if not typing:
             raise
@@ -986,17 +1187,50 @@ def _listen_loop(model, typing):
         _typed_only_loop()
         return
 
-    try:
-        _voice_loop(model, stream, typing)
-    finally:
+    while True:
         try:
-            stream.stop()
-            stream.close()
+            _voice_loop(model, stream, typing)
+            return
+        except sd.PortAudioError as e:
+            # The device vanished mid-read (headset unplugged, driver blip).
+            # Close it and try to reopen; typed input still works meanwhile
+            # only if we come back to a fresh stream, so do that in-loop.
+            print("microphone lost ({}); reopening...".format(e))
+        except KeyboardInterrupt:
+            raise
+        finally:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception as e:
+                print("couldn't close the microphone: {}".format(e))
+
+        try:
+            stream = _open_with_retry()
         except Exception as e:
-            print("couldn't close the microphone: {}".format(e))
+            if typing:
+                print("microphone didn't come back ({}) -- typed input only".format(e))
+                ui.set_state(ui.LISTENING)
+                _typed_only_loop()
+                return
+            raise
 
 
 def main():
+    # A provider reply is spoken, and it is also printed. The Windows console
+    # defaults to cp1252, and model text carries characters it cannot encode
+    # (curly quotes, non-breaking hyphens) -- a print() that raises on that
+    # would turn a successful generation into a reported failure. Replace
+    # unencodable characters rather than crash the turn.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
     # Load first, draw second. openwakeword and PortAudio both emit startup
     # chatter from native code, which goes to the real file descriptors and
     # sails straight past the stdout proxy -- so anything drawn before this
@@ -1005,6 +1239,10 @@ def main():
     get_output_stream()  # open the speaker up front so the first reply isn't slow
     cues.warm()  # render the earcons now, not while you're waiting to talk
     chat.warm()  # fetch the free-model list on a thread, off the first question
+    # Loading the Moonshine synthesizer takes several seconds on first use --
+    # if it isn't warmed, the first reply pays that latency on top of the
+    # reply itself. Warm it on a thread during startup instead.
+    tts_moonshine.warm()
 
     # Read the preferences file now rather than on the first turn that needs
     # it. It's a few hundred bytes, and doing it here means the "loaded N
@@ -1016,11 +1254,16 @@ def main():
     except Exception as e:
         print("couldn't load preferences: {}".format(e))
 
-    # Same reasoning as the line above: a middle STT tier that isn't configured
-    # is invisible until the day Gemini blips, and then it looks like Jarvis
-    # suddenly went deaf. Say which tiers exist while there's still a log to
-    # read it in.
-    print(stt_openrouter.status())
+    sweep_recordings()  # clear clips orphaned by a crash or force-kill
+
+    devlog.sys_event("startup", "OK", "dev log on")
+    devlog.stt("moonshine", "setup", "INFO",
+               detail="available={} compression={}".format(
+                   stt_moonshine.available(),
+                   os.getenv("MOONSHINE_COMPRESSION", "medium_streaming")))
+    devlog.tts("moonshine", "setup", "INFO",
+               detail="available={} voice={}".format(
+                   tts_moonshine.available(), os.getenv("MOONSHINE_VOICE", "kokoro_af_sky")))
 
     ui.start()  # no-op when stdout isn't a terminal, or JARVIS_NO_UI is set
 
