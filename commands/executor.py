@@ -35,14 +35,23 @@ import mss.tools
 from pycaw.pycaw import AudioUtilities
 
 from commands import app_index
+from commands import browser_automation
 from commands import clipboard_actions
 from commands import cmd_control
+from commands import docs
 from commands import file_actions
+from commands import file_analysis
 from commands import locate
 from commands import memory
 from commands import notify as notifications
+from commands import pdf_export
 from commands import screen_actions
+from commands import sheets
+from commands import slides
+from commands import web_search
+from commands import website_builder
 from commands import window_actions
+from commands import youtube_video
 
 SCREENSHOTS_DIR = "screenshots"
 
@@ -278,6 +287,63 @@ def _run_one(action):
         return _call(
             cmd_control.explain, _first(action, "command", "cmd", "text")
         )
+
+    # --- Tier 6: content & productivity -------------------------------------
+    if kind == "make_doc":
+        return _call(
+            docs.make_docx,
+            _first(action, "prompt", "text", "request"),
+            _first(action, "target", "name", "where", default=""),
+        )
+    if kind == "make_pptx":
+        return _call(
+            slides.make_pptx,
+            _first(action, "prompt", "text", "request"),
+            _first(action, "target", "name", "where", default=""),
+        )
+    if kind == "make_xlsx":
+        return _call(
+            sheets.make_xlsx,
+            _first(action, "prompt", "text", "request"),
+            _first(action, "target", "name", "where", default=""),
+        )
+    if kind == "make_pdf":
+        return _call(
+            pdf_export.make_pdf,
+            _first(action, "prompt", "text", "request"),
+            _first(action, "target", "name", "where", default=""),
+        )
+    if kind == "analyze_file":
+        return _call(
+            file_analysis.analyze_file,
+            _first(action, "target", "file", "path", "source"),
+            _first(action, "question", "query", "ask", default=""),
+        )
+    if kind == "youtube_summary":
+        return _call(
+            youtube_video.youtube_summary,
+            _first(action, "target", "url", "query", "video"),
+            _first(action, "question", "ask", "query", default=""),
+        )
+    if kind == "web_search":
+        return _call(
+            web_search.web_search,
+            _first(action, "query", "target", "text"),
+            _first(action, "question", "ask", "detail", default=""),
+        )
+    if kind == "browser_run":
+        return _call(
+            browser_automation.browser_run,
+            _first(action, "instruction", "text", "prompt", "task"),
+        )
+    if kind == "build_website":
+        return _call(
+            website_builder.build_website,
+            _first(action, "prompt", "text", "request"),
+            _first(action, "target", "name", "where", default=""),
+        )
+    if kind == "stop_preview":
+        return _call(website_builder.stop_preview_voice)
 
     if kind == "unknown":
         msg = f"Didn't understand: \"{action.get('raw', '')}\""

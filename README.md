@@ -13,7 +13,7 @@ history, notifications and an action-confirmation protocol.
 - **Command router** (`commands/parser.py`) — classifies a turn as `command`,
   `chat`, or `both`. Chat-only turns are answered without touching the action
   engine; `both` runs the action and feeds its real output back to the brain.
-- **15 command modules** — see table below.
+- **24 command modules** — see table below.
 - **TTS** — Moonshine's local voices (Kokoro/Piper, via its C core), played
   straight through with no time-stretch, with overlap: the reply starts while
   actions are still running.
@@ -66,7 +66,7 @@ No manual download step.
 |---|---|---|
 | `MOONSHINE_COMPRESSION` | Moonshine STT model size (`listener/stt_moonshine.py`); default `medium_streaming` | optional |
 | `MOONSHINE_VOICE` | Moonshine TTS voice (`listener/tts_moonshine.py`); default `kokoro_af_sky` | optional |
-| `GEMINI_API_KEY` | screen understanding (`commands/screen_actions.py`) | only if that feature is used |
+| `GEMINI_API_KEY` | screen understanding (`commands/screen_actions.py`) + all Tier 6 content generation and summarising (`commands/genbrain.py`) | only if those features are used |
 | `OPENROUTER_API_KEY` | chat brain (`commands/chat.py:184`) | for conversational chat |
 | `GROQ_API_KEY` | parser brain (`commands/parser.py:388`) | for command routing |
 | `JARVIS_NO_UI` | set non-empty to force the terminal UI off | optional |
@@ -107,6 +107,16 @@ No manual download step.
 | `memory.py` | persistent preferences |
 | `self_guard.py` | safety guardrails for system actions |
 | `paths.py` | path resolution helpers |
+| `genbrain.py` | shared Gemini content brain (structured JSON + summarising) |
+| `docs.py` | prompt → Word document (python-docx) |
+| `slides.py` | prompt → slide deck (python-pptx) |
+| `sheets.py` | prompt → spreadsheet (openpyxl) |
+| `pdf_export.py` | prompt → PDF report (reportlab) |
+| `file_analysis.py` | read + answer about a PDF / CSV / Excel / audio / text file |
+| `youtube_video.py` | fetch + summarise a YouTube transcript |
+| `web_search.py` | query + summarise the web (ddgs + BeautifulSoup) |
+| `browser_automation.py` | bounded scripted browser workflows (Playwright, declarative steps only) |
+| `website_builder.py` | prompt → small static site + local preview (single non-leaking server on 127.0.0.1) |
 
 ## How a turn flows
 

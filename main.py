@@ -44,6 +44,7 @@ interleave.
 
 import os
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -135,6 +136,9 @@ SPOKEN_RESULTS = {
     "read_clipboard", "run_command", "explain_command",
     "list_memory", "what_do_you_remember", "show_memory",
     "understand_screen",
+    # Tier 6: the result is the answer, a read that comes back as prose.
+    "analyze_file", "youtube_summary", "web_search", "browser_run",
+    "stop_preview",
 }
 
 # How many times to re-record for an answer to a pending confirmation before
@@ -395,10 +399,16 @@ class _Voice:
             # `spoken` rather than self._text: if a previous wait() timed out
             # and this attribute is reassigned underneath a still-running
             # thread, the closure should still say what it was handed.
+            t0 = time.perf_counter()
             try:
                 tts.speak(spoken, on_first_audio=self._on_first_audio)
+                devlog.tts("moonshine", "speak", "OK",
+                           detail=spoken, seconds=time.perf_counter() - t0)
             except Exception as e:
                 print("speech failed: {}".format(e))
+                devlog.tts("moonshine", "speak", "FAIL",
+                           detail="{}: {}".format(e, spoken),
+                           seconds=time.perf_counter() - t0)
 
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
@@ -415,6 +425,7 @@ class _Voice:
         """
         self.wait()
         feeder = tts.SentenceFeeder()
+        t_s0 = time.perf_counter()
 
         def run():
             try:
@@ -436,6 +447,9 @@ class _Voice:
 
         self._text = str(text or "")
         logbook.jarvis(self._text)
+        if self._text.strip():
+            devlog.tts("moonshine", "speak", "OK",
+                       detail=self._text, seconds=time.perf_counter() - t_s0)
         return self._text
 
     def wait(self):
@@ -1206,6 +1220,17 @@ def _listen_loop(model, typing):
 
 
 def main():
+    # A provider reply is spoken, and it is also printed. The Windows console
+    # defaults to cp1252, and model text carries characters it cannot encode
+    # (curly quotes, non-breaking hyphens) -- a print() that raises on that
+    # would turn a successful generation into a reported failure. Replace
+    # unencodable characters rather than crash the turn.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
     # Load first, draw second. openwakeword and PortAudio both emit startup
     # chatter from native code, which goes to the real file descriptors and
     # sails straight past the stdout proxy -- so anything drawn before this
