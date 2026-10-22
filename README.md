@@ -72,6 +72,7 @@ No manual download step.
 | `FISH_API_KEY` | primary TTS voice, Fish Audio S2.1 Pro (`listener/tts_fish.py`); without it Moonshine speaks | recommended |
 | `FISH_VOICE_ID` | Fish Audio voice model id (`reference_id`); unset uses Fish's default voice | optional |
 | `FISH_MODEL` | Fish Audio model header; default `s2.1-pro-free` (free tier), `s2.1-pro` for paid | optional |
+| `FISH_LATENCY` | Fish Audio speed/quality trade-off: `low`, `normal` or `balanced` (default); `low` starts talking sooner with slightly lower voice quality | optional |
 | `FISH_CACHE` | `0` turns off the on-disk cache of short Fish replies (`cache/tts_fish/`); on by default | optional |
 | `MOONSHINE_VOICE` | fallback Moonshine TTS voice (`listener/tts_moonshine.py`); default `kokoro_af_bella` | optional |
 | `GEMINI_API_KEY` | screen understanding (`commands/screen_actions.py`) + all Tier 6 content generation and summarising (`commands/genbrain.py`) | only if those features are used |

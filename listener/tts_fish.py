@@ -18,6 +18,8 @@ FISH_API_KEY    required to enable this voice (fish.audio/app/api-keys)
 FISH_VOICE_ID   optional voice model id (`reference_id`) from fish.audio;
                 unset uses Fish's default voice
 FISH_MODEL      optional model header; default s2.1-pro-free
+FISH_LATENCY    low | normal | balanced (default balanced); low starts
+                talking sooner at a slight cost in voice quality
 FISH_CACHE      0 turns off the on-disk phrase cache (default on)
 
 A 401/402/403 (bad key, out of credit, free tier ended) turns this voice off
@@ -43,6 +45,13 @@ API_URL = "https://api.fish.audio/v1/tts"
 API_KEY = os.getenv("FISH_API_KEY", "").strip()
 VOICE_ID = os.getenv("FISH_VOICE_ID", "").strip()
 MODEL = os.getenv("FISH_MODEL", "s2.1-pro-free").strip() or "s2.1-pro-free"
+
+_LATENCIES = ("low", "normal", "balanced")
+LATENCY = os.getenv("FISH_LATENCY", "balanced").strip().lower() or "balanced"
+if LATENCY not in _LATENCIES:
+    print("tts_fish: FISH_LATENCY={!r} isn't one of {}; using balanced".format(
+        LATENCY, ", ".join(_LATENCIES)))
+    LATENCY = "balanced"
 
 # Same rate the shared output stream is opened at (and the earcons use), so
 # a reply never forces the device stream to close and reopen.
@@ -122,7 +131,7 @@ def _body(text):
         "text": str(text).strip(),
         "format": "pcm",
         "sample_rate": SAMPLE_RATE,
-        "latency": "balanced",
+        "latency": LATENCY,
         "normalize": True,
     }
     if VOICE_ID:
@@ -145,7 +154,7 @@ _CACHE_MAX_FILES = 300  # ~3s of 24kHz PCM each is ~150KB, so tens of MB at most
 
 
 def _cache_path(text):
-    key = "|".join((MODEL, VOICE_ID, str(SAMPLE_RATE), _body("")["latency"],
+    key = "|".join((MODEL, VOICE_ID, str(SAMPLE_RATE), LATENCY,
                     " ".join(str(text).split())))
     return _CACHE_DIR / (hashlib.sha1(key.encode("utf-8")).hexdigest() + ".pcm")
 
