@@ -10,10 +10,11 @@ tier over -- the same text is spoken by the local Moonshine voice
 (listener/tts_moonshine.py). last_engine() says which one actually spoke, for
 the dev log and the UI.
 
-speak_stream() keeps its name and shape for the streaming path in main.py's
-_Voice. The `pieces` iterator is drained into one reply and spoken as a
-single call: one request (or one Moonshine pass) per reply avoids a dead gap
-between sentences, the same behaviour the old local-first path had.
+speak_stream() is the streaming path for main.py's _Voice. On Fish it starts
+talking on the first finished sentence while the rest is still being written
+(tts_fish.speak_stream); anything Fish couldn't voice is handed to Moonshine.
+Moonshine alone still drains the whole reply into one pass, since each of its
+calls carries seconds of fixed overhead.
 """
 
 import queue
@@ -47,7 +48,10 @@ def speak(text, on_first_audio=None):
     """Speak `text`: Fish Audio first, Moonshine if Fish produced nothing.
     Returns the player, or None."""
     global _last_engine
-    if tts_fish.available():
+    # With a key configured, Fish is asked even after it switched itself off:
+    # its phrase cache can still voice a repeated short reply without a
+    # request, and it returns None straight away otherwise.
+    if tts_fish.API_KEY:
         player = tts_fish.speak(text, on_first_audio=on_first_audio)
         if player is not None:
             _last_engine = "fish"
@@ -60,15 +64,31 @@ def speak_stream(pieces, on_first_audio=None, expected_chars=None):
     """Speak text that is still being generated.
 
     `pieces` is any iterable of strings -- typically a SentenceFeeder fed by
-    commands/chat.py's on_sentence callback. All of it is drained into one
-    reply before it is synthesised as a whole.
+    commands/chat.py's on_sentence callback.
     """
+    global _last_engine
     if pieces is None:
         return None
+    if tts_fish.available():
+        player, unspoken = tts_fish.speak_stream(
+            pieces, on_first_audio=on_first_audio)
+        if player is not None:
+            _last_engine = "fish"
+        if unspoken.strip():
+            # Fish stopped partway (or never started): finish the reply in
+            # Moonshine's voice rather than drop the rest of it.
+            fallback = tts_moonshine.speak(
+                unspoken,
+                on_first_audio=on_first_audio if player is None else None)
+            if player is None:
+                _last_engine = "moonshine"
+                return fallback
+        return player
     text = " ".join(str(p) for p in pieces if p)
     if not text.strip():
         return None
-    return speak(text, on_first_audio=on_first_audio)
+    _last_engine = "moonshine"
+    return tts_moonshine.speak(text, on_first_audio=on_first_audio)
 
 
 def speak_async(text, on_first_audio=None):

@@ -17,7 +17,9 @@ history, notifications and an action-confirmation protocol.
 - **TTS** — Fish Audio's S2.1 Pro cloud voice (free `s2.1-pro-free` tier,
   streamed as raw PCM), falling back to Moonshine's offline voices
   (Kokoro/Piper, via its C core) when there's no key, no network, or Fish
-  refuses. Played straight through with no time-stretch, with overlap: the
+  refuses. Chat replies start speaking after the first sentence while the
+  rest is still being written, and short repeated replies ("Done.") play
+  from an on-disk cache. Played straight through with no time-stretch, with overlap: the
   reply starts while actions are still running.
 - **Screen understanding** — grabs the screen, downscales to 640×360 JPEG
   quality 55, and answers "what's on my screen" / "what does that error say" via
@@ -70,6 +72,7 @@ No manual download step.
 | `FISH_API_KEY` | primary TTS voice, Fish Audio S2.1 Pro (`listener/tts_fish.py`); without it Moonshine speaks | recommended |
 | `FISH_VOICE_ID` | Fish Audio voice model id (`reference_id`); unset uses Fish's default voice | optional |
 | `FISH_MODEL` | Fish Audio model header; default `s2.1-pro-free` (free tier), `s2.1-pro` for paid | optional |
+| `FISH_CACHE` | `0` turns off the on-disk cache of short Fish replies (`cache/tts_fish/`); on by default | optional |
 | `MOONSHINE_VOICE` | fallback Moonshine TTS voice (`listener/tts_moonshine.py`); default `kokoro_af_bella` | optional |
 | `GEMINI_API_KEY` | screen understanding (`commands/screen_actions.py`) + all Tier 6 content generation and summarising (`commands/genbrain.py`) | only if those features are used |
 | `OPENROUTER_API_KEY` | chat brain (`commands/chat.py:184`) | for conversational chat |
