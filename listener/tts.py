@@ -38,10 +38,19 @@ def last_engine():
 
 
 def warm():
-    """Pre-warms both voices: Fish's connection, and Moonshine's model so a
-    fallback doesn't pay several seconds of load on top of the reply."""
-    tts_fish.warm()
-    tts_moonshine.warm()
+    """Pre-warms the voice the first reply will use.
+
+    With Fish configured, only its connection is opened: Moonshine's model
+    costs several seconds and a few hundred MB, and as a fallback it may never
+    be needed. It loads on first use instead (tts_moonshine.speak ->
+    load_model), so only the first fallback reply pays that time -- after Fish
+    turns itself off, every later reply is already warm. Without Fish,
+    Moonshine is the voice and is loaded up front as before.
+    """
+    if tts_fish.available():
+        tts_fish.warm()
+    else:
+        tts_moonshine.warm()
 
 
 def speak(text, on_first_audio=None):

@@ -1242,10 +1242,10 @@ def main():
     get_output_stream()  # open the speaker up front so the first reply isn't slow
     cues.warm()  # render the earcons now, not while you're waiting to talk
     chat.warm()  # fetch the free-model list on a thread, off the first question
-    # Open Fish Audio's connection, and load the Moonshine synthesizer (the
-    # offline fallback), on threads during startup. Moonshine takes several
-    # seconds on first use -- unwarmed, a fallback reply would pay that on
-    # top of the reply itself.
+    # Warm the voice the first reply will use, on a thread: Fish Audio's
+    # connection when it's configured, otherwise the Moonshine synthesizer
+    # (several seconds on first use). With Fish on, Moonshine loads only if
+    # a reply ever falls back to it -- see tts.warm().
     tts.warm()
 
     # Read the preferences file now rather than on the first turn that needs
