@@ -1375,7 +1375,9 @@ def main():
     # sails straight past the stdout proxy -- so anything drawn before this
     # point gets written over and leaves a fragment of a panel on screen.
     model = load_wake_word_model("hey_jarvis")
-    get_output_stream()  # open the speaker up front so the first reply isn't slow
+    # Open the speaker up front so the first reply isn't slow -- at the
+    # voice's own rate (FISH_SAMPLE_RATE), so it never has to reopen.
+    get_output_stream(tts.output_rate())
     cues.warm()  # render the earcons now, not while you're waiting to talk
     chat.warm()  # fetch the free-model list on a thread, off the first question
     # Warm the voice the first reply will use, on a thread: Fish Audio's
