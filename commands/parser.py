@@ -381,7 +381,9 @@ a developer" -> work). Use it instead of remember_this for those -- the
 profile goes into every prompt. Emit it in passing too, alongside whatever
 else the turn needs.
 "get_to_know_me": "get to know me", "learn about me", "ask me about myself",
-"set up my profile" -- a short interview. Mode "command", reply "Sure."
+"set up my profile" -- a short interview. Mode "command", reply "Sure." Emit
+ONLY get_to_know_me for that -- never set_profile alongside it unless the same
+message states a new fact ("get to know me, I'm Zeke"); the interview asks.
 
 A CORRECTION IS A PREFERENCE.
 This is the important one. When the user pushes back on how you did something --
@@ -569,7 +571,12 @@ def get_client():
             api_key = os.getenv("GROQ_API_KEY")
             if not api_key:
                 raise ValueError("GROQ_API_KEY not found in .env")
-            _client = Groq(api_key=api_key)
+            # No silent retries: the SDK's default is to sleep and retry on a
+            # 429, and Groq's free budget is 8K tokens a minute -- about one
+            # parse of this prompt -- so a second command within the minute
+            # sat there for 20-48s. Failing fast lets _open_stream hand the
+            # turn to Gemini instead.
+            _client = Groq(api_key=api_key, max_retries=0, timeout=20.0)
         return _client
 
 
@@ -764,15 +771,54 @@ MAX_TOKENS = 1024
 REASONING_EFFORT = os.getenv("PARSER_REASONING", "low")
 
 
+# After Groq refuses for being over its per-minute budget, skip it for this
+# long and go straight to the fallback -- asking again would just fail again.
+GROQ_COOLDOWN_SECONDS = 60
+_groq_cool_until = 0.0
+
+
+def _is_rate_limit(error):
+    text = str(error).lower()
+    return "429" in text or "rate limit" in text or "413" in text or "too large" in text
+
+
+def _gemini_parse(system, convo):
+    """The router on Gemini with minimal thinking: a fast JSON answer when
+    Groq is over its limit. Raises when Gemini isn't available."""
+    from commands import genbrain
+    if not os.getenv("GEMINI_API_KEY"):
+        raise RuntimeError("no GEMINI_API_KEY")
+    config = {"system_instruction": system, "response_mime_type": "application/json",
+              "max_output_tokens": MAX_TOKENS,
+              "thinking_config": {"thinking_level": "minimal"}}
+    try:
+        response = genbrain.client().models.generate_content(
+            model=genbrain.MODEL_NAME, contents=convo, config=config)
+    except Exception as e:
+        if "thinking" not in str(e).lower():
+            raise
+        config.pop("thinking_config")
+        response = genbrain.client().models.generate_content(
+            model=genbrain.MODEL_NAME, contents=convo, config=config)
+    text = (response.text or "").strip()
+    if not text:
+        raise RuntimeError("empty response")
+    return text
+
+
 def _open_stream(messages, t0):
     """(stream, None) from Groq, or (None, text) from the genbrain chain
     (Gemini, then OpenRouter) when Groq refuses -- a 413/429 on the free tier
     shouldn't turn a command into a chat turn that pretends to have done it.
     (None, None) when nothing answered at all."""
+    global _groq_cool_until
     from commands import devlog
     client = get_client()
     attempts = [{"extra_body": {"reasoning_effort": REASONING_EFFORT}}, {}]
     last = None
+    if time.time() < _groq_cool_until:
+        attempts = []  # still over the minute's budget: straight to Gemini
+        last = "Groq cooling down after a rate limit"
     for extra in attempts:
         try:
             return client.chat.completions.create(
@@ -786,16 +832,25 @@ def _open_stream(messages, t0):
             ), None
         except Exception as e:
             last = e
+            if _is_rate_limit(e):
+                _groq_cool_until = time.time() + GROQ_COOLDOWN_SECONDS
             # Only the reasoning option can be retried away; anything else
             # (rate limit, size, network) goes straight to the fallback.
             if "reasoning" not in str(e).lower():
                 break
     print("parser: Groq failed ({}), trying the fallback chain".format(last))
     devlog.route("reach", "FAIL", str(last)[:120], seconds=time.time() - t0)
+    convo = "\n".join("{}: {}".format(m["role"].upper(), m["content"])
+                      for m in messages[1:])
+    try:
+        text = _gemini_parse(messages[0]["content"],
+                             convo + "\nReturn the JSON object for the last USER message.")
+        devlog.route("reach", "OK", "gemini fallback", seconds=time.time() - t0)
+        return None, text
+    except Exception as e:
+        print("parser: Gemini fallback failed ({}), trying the rest".format(e))
     try:
         from commands import genbrain
-        convo = "\n".join("{}: {}".format(m["role"].upper(), m["content"])
-                          for m in messages[1:])
         text = genbrain._chain_text(messages[0]["content"],
                                     convo + "\nReturn the JSON object for the last USER message.",
                                     MAX_TOKENS, json_mode=True)

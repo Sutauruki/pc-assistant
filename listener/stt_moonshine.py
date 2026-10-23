@@ -103,6 +103,22 @@ def _transcriber():
         return _model
 
 
+def warm():
+    """Loads the model on a background thread at startup. Without it the
+    first thing you say pays the load (10-13s in the logs) on top of the
+    transcription itself."""
+    if not available():
+        return
+
+    def run():
+        try:
+            _transcriber()
+        except Exception as e:
+            print("stt: couldn't preload Moonshine ({})".format(e))
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def available():
     """True when the package is installed. The model itself downloads lazily
     on first transcribe, so this is cheap and never downloads."""

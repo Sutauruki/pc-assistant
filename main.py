@@ -147,8 +147,9 @@ SPOKEN_RESULTS = {
     "stop_preview",
     # The computer agent speaks its own result (and its own approval
     # questions, mid-task); research_explain's result is the explanation.
+    # set_profile is not here: its "I'll remember your name" would repeat
+    # the router's own "Got it." -- the reply already covers it.
     "computer_task", "research_explain", "system_info", "get_to_know_me",
-    "set_profile",
 }
 
 # Actions whose result is already a finished spoken answer. In mode "both"
@@ -1224,6 +1225,7 @@ def _follow_up(stream, model, typing):
     # answers keep coming -- one question per pass -- and pauses on the first
     # pass where nothing was said or typed (see the end of this function).
     passes = 0
+    quiet = 0
     while True:
         if not (confirm.is_pending() or onboarding.active()):
             return
@@ -1231,6 +1233,9 @@ def _follow_up(stream, model, typing):
             passes += 1
             if passes > MAX_CONFIRM_FOLLOWUPS:
                 break
+        elif quiet >= 3:
+            break  # ~40s of nothing: stop holding the mic open
+        quiet += 1
 
         settled = False
 
@@ -1239,12 +1244,12 @@ def _follow_up(stream, model, typing):
             if typed:
                 _guarded_turn(handle_typed, typed)
                 _settle(stream, model, typed=True)
-                settled = True
+                settled, quiet = True, 0
                 continue
 
         if _record_turn(stream, give_up_after=CONFIRM_SILENCE_SECONDS):
             _settle(stream, model, typed=False)
-            settled = True
+            settled, quiet = True, 0
             continue
 
         # The mic gave up. That is not the same as nobody answering: reading
@@ -1256,9 +1261,11 @@ def _follow_up(stream, model, typing):
             if typed:
                 _guarded_turn(handle_typed, typed)
                 _settle(stream, model, typed=True)
-                settled = True
+                settled, quiet = True, 0
                 continue
 
+        if onboarding.active() and not confirm.is_pending():
+            continue  # the interview gets a few quiet passes (see quiet above)
         break
 
     if confirm.is_pending():
@@ -1269,10 +1276,10 @@ def _follow_up(stream, model, typing):
         confirm.clear()
 
     if onboarding.active():
-        # Quiet: pause rather than let the next "hey Jarvis, open Chrome" be
-        # taken as an answer. "get to know me" resumes at the same question.
-        print("onboarding: no answer, pausing the interview")
-        onboarding.pause()
+        # Stop holding the mic open, but leave the interview waiting (for
+        # onboarding.ANSWER_SECONDS) -- a typed answer, or "hey Jarvis" plus
+        # an answer, still counts. A command pauses it (onboarding._COMMANDY).
+        print("onboarding: still waiting for an answer")
 
     if not settled:
         # Reached by giving up rather than by answering, including the case
@@ -1465,6 +1472,7 @@ def main():
     # (several seconds on first use). With Fish on, Moonshine loads only if
     # a reply ever falls back to it -- see tts.warm().
     tts.warm()
+    stt_moonshine.warm()  # load the speech model now, not on your first sentence
 
     # Read the preferences file now rather than on the first turn that needs
     # it. It's a few hundred bytes, and doing it here means the "loaded N

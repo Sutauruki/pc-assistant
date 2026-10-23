@@ -16,9 +16,25 @@ the answers are stored as they were said, so nothing you told it is lost.
 Nothing that looks like a password, code or card number is kept.
 """
 
+import re
 import threading
+import time
 
 from commands import recall
+
+# How long the interview waits for an answer after asking. Long enough to
+# read the question in the window and type a reply; after that the next
+# thing said is treated as a normal command again.
+ANSWER_SECONDS = 180
+
+# An "answer" that starts like this is a command -- "open Chrome", "what's the
+# weather" -- so it pauses the interview and runs normally instead of being
+# saved as your occupation.
+_COMMANDY = re.compile(
+    r"^(hey jarvis\b|open |close |launch |play |search |google |delete |move |"
+    r"copy |rename |minimi[sz]e|maximi[sz]e|turn |set the |take a |text |"
+    r"message |send |call |remind |what'?s (on|the)|how (much|many|do i)|can you |"
+    r"could you |please )", re.I)
 
 QUESTIONS = (
     ("name", "Let's do this quickly -- say skip for anything you'd rather not "
@@ -39,22 +55,60 @@ _STOP = {"stop", "that's enough", "thats enough", "enough", "later", "cancel",
          "done", "quit", "end", "finish", "not now"}
 
 _lock = threading.Lock()
-_state = {"active": False, "index": 0, "answers": {}}
+_state = {"active": False, "index": 0, "answers": {}, "asked": 0.0}
+
+# Questions the profile can already answer, and how to say they're known.
+_KNOWN = {
+    "name": (lambda p: p["name"] or p["call_me"], "your name"),
+    "location": (lambda p: p["location"], "where you're based"),
+    "work": (lambda p: p["work"], "what you do"),
+}
 
 
 def active():
     with _lock:
+        if _state["active"] and time.time() - _state["asked"] > ANSWER_SECONDS:
+            _state["active"] = False  # gone quiet: pause, keep the place
         return _state["active"]
+
+
+def _skip_known(index, profile):
+    """Moves past questions the profile already answers. Returns (index,
+    names of what was skipped)."""
+    skipped = []
+    while index < len(QUESTIONS) and QUESTIONS[index][0] in _KNOWN:
+        known, label = _KNOWN[QUESTIONS[index][0]]
+        if not known(profile):
+            break
+        skipped.append(label)
+        index += 1
+    return index, skipped
+
+
+def _question(index, lead=""):
+    text = QUESTIONS[index][1]
+    if index and text.startswith("Let's"):
+        text = text.split("First, ", 1)[-1]
+    return (lead + " " + text).strip() if lead else text
 
 
 def start():
     """Begins the interview, or resumes a paused one. Returns the question."""
+    profile = recall.profile()
     with _lock:
-        _state["active"] = True
-        index = _state["index"]
-        if index:
-            return "Picking up where we left off. " + QUESTIONS[index][1]
-        return QUESTIONS[0][1]
+        resumed = _state["index"] > 0
+        index, skipped = _skip_known(_state["index"], profile)
+        _state.update(active=True, index=index, asked=time.time())
+        if index >= len(QUESTIONS):
+            _state.update(active=False, index=0)
+            return "I've already got everything I'd ask. Tell me anything new anytime."
+        lead = "Picking up where we left off." if resumed else ""
+        if skipped:
+            lead = (lead + " I already know {}, so I'll skip {}.".format(
+                " and ".join(skipped), "that" if len(skipped) == 1 else "those")).strip()
+            if not resumed:
+                lead = "Say skip for anything you'd rather not share. " + lead
+        return _question(index, lead)
 
 
 def pause():
@@ -71,17 +125,23 @@ def answer(text):
     """Takes the answer to the current question. Returns what to say next:
     the next question, or the wrap-up. None if no interview is running."""
     said = _norm(text)
+    if not active():
+        return None
+    if _COMMANDY.match(said):
+        pause()
+        return None  # let it run as the command it is
+    profile = recall.profile()
     with _lock:
-        if not _state["active"]:
-            return None
         stopped = said in _STOP
         if not stopped:
             key = QUESTIONS[_state["index"]][0]
             if said and said not in _SKIP and recall.secret_reason(text) is None:
                 _state["answers"][key] = " ".join(str(text).split())
-            _state["index"] += 1
-            if _state["index"] < len(QUESTIONS):
-                return QUESTIONS[_state["index"]][1]
+            index, _skipped = _skip_known(_state["index"] + 1, profile)
+            _state["index"] = index
+            if index < len(QUESTIONS):
+                _state["asked"] = time.time()
+                return _question(index)
         # Finished or stopped: save, and start fresh next time.
         answers = dict(_state["answers"])
         _state.update(active=False, index=0, answers={})
