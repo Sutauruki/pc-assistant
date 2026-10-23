@@ -8,8 +8,10 @@ history, notifications and an action-confirmation protocol.
 
 - **Wake word loop** — openWakeWord (`hey_jarvis`), cooldown model reset, typed
   turns bypass the cooldown.
-- **STT** — Moonshine, a single fully-offline, open-vocabulary tier (no cloud,
-  no key, no rate limit). Nothing spoken has to leave the machine.
+- **STT** — Groq Whisper (`whisper-large-v3-turbo`, usually under a second)
+  when `GROQ_TTS_API_KEY` is set, falling back to Moonshine: fully offline,
+  open-vocabulary, no key, no rate limit. Without the key nothing spoken
+  leaves the machine.
 - **Command router** (`commands/parser.py`) — classifies a turn as `command`,
   `chat`, or `both`. Chat-only turns are answered without touching the action
   engine; `both` runs the action and feeds its real output back to the brain.
@@ -87,6 +89,8 @@ No manual download step.
 
 | Variable | Used by | Required |
 |---|---|---|
+| `GROQ_TTS_API_KEY` | Groq Whisper speech-to-text (`listener/stt_groq.py`), fast and accurate, with Moonshine as the fallback. A separate key from `GROQ_API_KEY` so hearing and parsing use different limits. Unset = offline Moonshine only | optional |
+| `STT_ENGINE` | `moonshine` keeps hearing offline even when a Groq key is set | optional |
 | `MOONSHINE_COMPRESSION` | Moonshine STT model size (`listener/stt_moonshine.py`); default `medium_streaming` | optional |
 | `FISH_API_KEY` | primary TTS voice, Fish Audio S2.1 Pro (`listener/tts_fish.py`); without it Moonshine speaks | recommended |
 | `FISH_VOICE_ID` | Fish Audio voice model id (`reference_id`); unset uses Fish's default voice | optional |

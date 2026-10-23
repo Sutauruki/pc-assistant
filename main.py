@@ -59,6 +59,7 @@ from listener.wake_word import load_wake_word_model, check_wake_word
 from listener.record import record_until_silence
 from listener import console_input
 from listener import cues
+from listener import stt_groq
 from listener import stt_moonshine
 from listener import tts_fish
 from listener import tts_moonshine
@@ -287,12 +288,30 @@ def sweep_recordings():
 
 
 def transcribe(audio):
-    """Moonshine -- the only ear, and a fully offline one.
+    """Groq Whisper first (listener/stt_groq.py, when GROQ_TTS_API_KEY is
+    set), then Moonshine -- fully offline -- as the fallback, or as the only
+    ear when there's no key or STT_ENGINE=moonshine."""
+    if stt_groq.available():
+        t0 = time.perf_counter()
+        try:
+            text = stt_groq.transcribe(audio)
+            devlog.stt("groq", "transcribe", "OK" if text else "SKIP",
+                       detail=(("...{}".format(text[-80:]) if len(text) > 80 else text)
+                               if text else "silence"),
+                       seconds=time.perf_counter() - t0)
+            ui.set_engine(stt="groq")
+            if text:
+                print('Heard (Groq): "{}"'.format(text))
+                ui.set_heard(text)
+            else:
+                print("Heard (Groq): silence")
+            return text
+        except Exception as e:
+            devlog.stt("groq", "transcribe", "FAIL", detail=str(e)[:120],
+                       seconds=time.perf_counter() - t0)
+            print("Groq STT failed ({}), using Moonshine.".format(e))
 
-    Gemini, OpenRouter and Vosk are gone; nothing heard here has to leave the
-    machine. Moonshine is open-vocabulary, so a long free-form question
-    survives contact with the transcript just as well as a one-word command.
-    """
+    ui.set_engine(stt="moonshine")
     if not stt_moonshine.available():
         devlog.stt("moonshine", "transcribe", "SKIP", detail="not installed")
         print("Moonshine STT not installed")
@@ -1472,7 +1491,11 @@ def main():
     # (several seconds on first use). With Fish on, Moonshine loads only if
     # a reply ever falls back to it -- see tts.warm().
     tts.warm()
-    stt_moonshine.warm()  # load the speech model now, not on your first sentence
+    # Load the offline speech model now, not on your first sentence -- unless
+    # Groq Whisper is the ear, in which case Moonshine is only the fallback
+    # and loads if it's ever needed (it costs a few hundred MB to keep warm).
+    if not stt_groq.configured():
+        stt_moonshine.warm()
 
     # Read the preferences file now rather than on the first turn that needs
     # it. It's a few hundred bytes, and doing it here means the "loaded N
@@ -1488,6 +1511,8 @@ def main():
     _restore_history()  # pick up where the last run left off
 
     devlog.sys_event("startup", "OK", "dev log on")
+    devlog.stt("groq", "setup", "INFO", detail=stt_groq.status())
+    ui.set_engine(stt="groq" if stt_groq.configured() else "moonshine")
     devlog.stt("moonshine", "setup", "INFO",
                detail="available={} compression={}".format(
                    stt_moonshine.available(),
