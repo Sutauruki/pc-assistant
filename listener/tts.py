@@ -27,6 +27,16 @@ _DONE = object()
 _last_engine = "fish" if tts_fish.available() else "moonshine"
 
 
+def output_rate():
+    """The sample rate the first reply will play at -- main.py opens the
+    speaker at it up front, so the voice and the cues share one stream that
+    never has to switch rates."""
+    if tts_fish.available():
+        return tts_fish.SAMPLE_RATE
+    from listener import audio_out
+    return audio_out.DEFAULT_SAMPLE_RATE
+
+
 def primary_engine():
     """The engine the next reply will try first."""
     return "fish" if tts_fish.available() else "moonshine"

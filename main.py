@@ -72,6 +72,7 @@ from commands import devlog
 from commands import logbook
 from commands import memory
 from commands import notify
+from commands import recall
 from commands.parser import parse_command, generate_reply, remember
 from commands.executor import execute_actions
 
@@ -682,6 +683,8 @@ def _run_turn(text, t_start, marks):
         return
 
     logbook.user(text)
+    # Long-term facts relevant to these words go into this turn's prompts.
+    recall.set_focus(text)
 
     # A parked question owns the next thing said, whatever it was going to be.
     if confirm.is_pending():
@@ -832,7 +835,13 @@ def _run_turn(text, t_start, marks):
         # question can be answered from the notification without speaking or
         # typing into the terminal. Falls back to a plain toast showing the
         # question when no interactive backend is installed.
-        notify.confirm("Jarvis", question, _answer_from_toast)
+        # Never let the toast take the question down with it: a failure in
+        # here used to raise out of the turn, and _guarded_turn's clean-up
+        # then cleared the very confirmation it was showing.
+        try:
+            notify.confirm("Jarvis", question, _answer_from_toast)
+        except Exception as e:
+            print("couldn't show the confirmation toast ({})".format(e))
         _finish(marks, t_start)
         return
 
@@ -1306,6 +1315,27 @@ def _listen_loop(model, typing):
             raise
 
 
+def _restore_history():
+    """Brings back the last few turns from before a restart (recall.py), so
+    "and close it" or "yes" after a restart still has something to refer to.
+    Loaded straight into the router's and chat's short-term history -- not
+    through remember(), which would log them a second time."""
+    from commands import parser as router
+    try:
+        turns = recall.recent(max(router.ROUTER_HISTORY_TURNS, chat.HISTORY_TURNS))
+    except Exception as e:
+        print("couldn't restore history ({})".format(e))
+        return
+    with router._history_lock:
+        for user, jarvis in turns[-router.ROUTER_HISTORY_TURNS:]:
+            router._history.append((user[:router.HISTORY_CHARS],
+                                    jarvis[:router.HISTORY_CHARS]))
+    for user, jarvis in turns[-chat.HISTORY_TURNS:]:
+        chat.remember(user, jarvis)
+    if turns:
+        print("restored {} recent turn{}".format(len(turns), "" if len(turns) == 1 else "s"))
+
+
 def _clear_terminal():
     """Wipes the console -- screen and scrollback -- so Jarvis's panel sits
     alone, with none of the shell history or startup chatter above it.
@@ -1345,7 +1375,9 @@ def main():
     # sails straight past the stdout proxy -- so anything drawn before this
     # point gets written over and leaves a fragment of a panel on screen.
     model = load_wake_word_model("hey_jarvis")
-    get_output_stream()  # open the speaker up front so the first reply isn't slow
+    # Open the speaker up front so the first reply isn't slow -- at the
+    # voice's own rate (FISH_SAMPLE_RATE), so it never has to reopen.
+    get_output_stream(tts.output_rate())
     cues.warm()  # render the earcons now, not while you're waiting to talk
     chat.warm()  # fetch the free-model list on a thread, off the first question
     # Warm the voice the first reply will use, on a thread: Fish Audio's
@@ -1365,6 +1397,7 @@ def main():
         print("couldn't load preferences: {}".format(e))
 
     sweep_recordings()  # clear clips orphaned by a crash or force-kill
+    _restore_history()  # pick up where the last run left off
 
     devlog.sys_event("startup", "OK", "dev log on")
     devlog.stt("moonshine", "setup", "INFO",

@@ -20,6 +20,10 @@ FISH_VOICE_ID   optional voice model id (`reference_id`) from fish.audio;
 FISH_MODEL      optional model header; default s2.1-pro-free
 FISH_LATENCY    low | normal | balanced (default balanced); low starts
                 talking sooner at a slight cost in voice quality
+FISH_SAMPLE_RATE  8000 | 16000 | 24000 | 32000 | 44100 (default 44100, Fish's
+                native rate -- nothing is downsampled). main.py opens the
+                speaker at this rate from the start, so it never has to
+                switch rates mid-reply (that switch is what can click).
 FISH_CACHE      0 turns off the on-disk phrase cache (default on)
 
 A 401/402/403 (bad key, out of credit, free tier ended) turns this voice off
@@ -39,7 +43,7 @@ try:
 except Exception:  # pragma: no cover - .env is optional
     pass
 
-from listener.audio_out import DEFAULT_SAMPLE_RATE, StreamingPlayer
+from listener.audio_out import StreamingPlayer
 
 API_URL = "https://api.fish.audio/v1/tts"
 API_KEY = os.getenv("FISH_API_KEY", "").strip()
@@ -53,9 +57,20 @@ if LATENCY not in _LATENCIES:
         LATENCY, ", ".join(_LATENCIES)))
     LATENCY = "balanced"
 
-# Same rate the shared output stream is opened at (and the earcons use), so
-# a reply never forces the device stream to close and reopen.
-SAMPLE_RATE = DEFAULT_SAMPLE_RATE
+# The rates Fish offers for raw PCM. 44100 is what the model produces, so
+# it's sent untouched; lower rates are downsampled on Fish's side. The speaker
+# stream is opened at this same rate at startup (tts.output_rate()), and the
+# earcons render at whatever rate the stream is open at, so nothing ever
+# forces the device to close and reopen mid-conversation.
+_RATES = (8000, 16000, 24000, 32000, 44100)
+try:
+    SAMPLE_RATE = int(os.getenv("FISH_SAMPLE_RATE", "44100").strip() or 44100)
+except ValueError:
+    SAMPLE_RATE = 0
+if SAMPLE_RATE not in _RATES:
+    print("tts_fish: FISH_SAMPLE_RATE must be one of {}; using 44100".format(
+        ", ".join(str(r) for r in _RATES)))
+    SAMPLE_RATE = 44100
 
 # Status codes that won't fix themselves within a session.
 _FATAL_STATUS = (401, 402, 403)
@@ -150,7 +165,7 @@ def _body(text):
 _CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "tts_fish"
 _CACHE_ON = os.getenv("FISH_CACHE", "1").strip().lower() not in ("0", "false", "no", "off")
 _CACHE_MAX_CHARS = 120
-_CACHE_MAX_FILES = 300  # ~3s of 24kHz PCM each is ~150KB, so tens of MB at most
+_CACHE_MAX_FILES = 300  # ~3s of 44.1kHz PCM is ~260KB, so ~80MB at the very most
 
 
 def _cache_path(text):

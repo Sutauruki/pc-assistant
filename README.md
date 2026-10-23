@@ -79,6 +79,7 @@ No manual download step.
 | `FISH_API_KEY` | primary TTS voice, Fish Audio S2.1 Pro (`listener/tts_fish.py`); without it Moonshine speaks | recommended |
 | `FISH_VOICE_ID` | Fish Audio voice model id (`reference_id`); unset uses Fish's default voice | optional |
 | `FISH_MODEL` | Fish Audio model header; default `s2.1-pro-free` (free tier), `s2.1-pro` for paid | optional |
+| `FISH_SAMPLE_RATE` | Fish audio sample rate: `44100` (default, Fish's native rate, nothing downsampled), `32000`, `24000`, `16000`, `8000`; the speaker opens at this rate so it never switches mid-reply | optional |
 | `FISH_LATENCY` | Fish Audio speed/quality trade-off: `low`, `normal` or `balanced` (default); `low` starts talking sooner with slightly lower voice quality | optional |
 | `FISH_CACHE` | `0` turns off the on-disk cache of short Fish replies (`cache/tts_fish/`); on by default | optional |
 | `MOONSHINE_VOICE` | fallback Moonshine TTS voice (`listener/tts_moonshine.py`); default `kokoro_af_bella` | optional |
@@ -210,6 +211,21 @@ anything stricter use a paid Gemini key, whose data isn't used that way.
 **If Chrome pages show no numbered boxes** — Chrome exposes page contents to
 Windows accessibility on demand; if it doesn't on your machine, start Chrome
 with `--force-renderer-accessibility` (add it to the shortcut's Target).
+
+## Memory
+
+| Kind | Example | Kept |
+|---|---|---|
+| Preferences | "keep answers short" | forever (`jarvis_prefs.json`) |
+| Facts | "my sister is Tolu, saved as Tolu Ade on WhatsApp" | forever (`data/facts.json`) |
+| Conversation | the last few turns | across restarts within 6 hours (`data/conversation.jsonl`) |
+
+Say "remember that..." -- or just mention a lasting fact ("text my sister
+Tolu...") and Jarvis keeps it. "Forget that..." removes it; "what do you
+remember" lists it. Each turn pulls in only the few facts relevant to what you
+said (a local keyword match, well under a millisecond), so memory never slows
+a reply or bloats the prompts. Passwords, PINs, codes, card/account numbers
+and your API keys are refused -- the files are plain text on your disk.
 
 ## Where files go
 
