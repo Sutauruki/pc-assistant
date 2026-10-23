@@ -324,6 +324,10 @@ class Dashboard(object):
         self._pending = None
         self._delayed = []
         self._last_level = 0.0
+        # Loudest level since the desktop window last asked (window_ui.py).
+        # Kept even when the terminal panel is off, and never delayed -- the
+        # window redraws far less often than the panel.
+        self._window_level = 0.0
         self._spin = 0
         self._tick = 0
         self._last_activity = 0
@@ -541,9 +545,27 @@ class Dashboard(object):
                 self._delayed[index] = level
 
     def push_rms(self, rms, delay=0.0):
+        level = level_from_rms(rms)
+        if level > self._window_level:
+            self._window_level = level  # a float store: atomic under the GIL
         if not self._active:
             return
-        self.push_level(level_from_rms(rms), delay=delay)
+        self.push_level(level, delay=delay)
+
+    def take_window_level(self):
+        """Loudest level since the last call, then reset (window_ui.py)."""
+        level, self._window_level = self._window_level, 0.0
+        return level
+
+    def snapshot(self):
+        """What's on the panel, as plain data -- for the desktop window,
+        which reads this rather than keeping a second copy of the state."""
+        with self._lock:
+            return {
+                "state": self._state, "heard": self._heard,
+                "reply": self._reply, "timing": self._timing,
+                "stt": self._stt, "tts": self._tts, "turns": self._turns,
+            }
 
     def set_heard(self, text):
         with self._lock:
@@ -1230,6 +1252,14 @@ def set_state(state):
 
 def push_level(level, delay=0.0):
     _dashboard.push_level(level, delay=delay)
+
+
+def snapshot():
+    return _dashboard.snapshot()
+
+
+def take_window_level():
+    return _dashboard.take_window_level()
 
 
 def push_rms(rms, delay=0.0):

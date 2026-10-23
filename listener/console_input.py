@@ -632,6 +632,16 @@ def stop():
     ui.enable_input(False)
 
 
+def submit(text):
+    """A line from somewhere other than the console -- the desktop window's
+    input box and its Yes/No buttons (window_ui.py). Lands in the same queue
+    as typed lines, so main.py treats it exactly like typing: including as a
+    physical answer to a confirmation, which a click or a typed line is."""
+    line = str(text or "").strip()[:MAX_INPUT_CHARS]
+    if line:
+        _queue.put(line)
+
+
 def poll():
     """The next submitted line, or None. Never blocks."""
     try:

@@ -445,6 +445,10 @@ class _Run(object):
             if not now or not window or now["hwnd"] != window["hwnd"]:
                 raise _Refused("the window changed since you looked -- look again")
             blocked = pc_policy.blocked_reason(now) or pc_policy.sensitive_reason(now)
+            if now.get("pid") == os.getpid():
+                # Jarvis's own window (the desktop panel, its Yes button): the
+                # agent must never answer its own questions.
+                blocked = "that's Jarvis's own window"
             if blocked:
                 raise _Refused("not allowed here: {}".format(blocked))
             # Moving the mouse yourself means you're taking over.
@@ -587,6 +591,21 @@ def run_task(task):
     deadline = time.time() + TIMEOUT_SECONDS
     failures = 0
 
+    # Jarvis's own window steps aside while the agent works, so it can't sit
+    # over a spot the agent clicks or end up in its screenshots.
+    try:
+        from listener import window_ui
+        window_ui.set_agent_busy(True)
+    except Exception:
+        window_ui = None
+    try:
+        return _run_guarded(task, inp, deadline, failures)
+    finally:
+        if window_ui is not None:
+            window_ui.set_agent_busy(False)
+
+
+def _run_guarded(task, inp, deadline, failures):
     with inp.Guard() as guard:
         run = _Run(task, guard)
         try:

@@ -38,6 +38,13 @@ history, notifications and an action-confirmation protocol.
   Off by default.
 - **Typed input** — full command parser available from the keyboard; typed turns
   skip the 0.4 s wake-word cooldown entirely.
+- **Desktop window** (`listener/window_ui.py`) — a small always-on-top panel:
+  a status orb (teal listening, red recording, amber thinking, blue speaking,
+  pulsing with the voice), what you said, the reply, an input box, and Yes/No
+  buttons whenever Jarvis asks to confirm. Tkinter, so nothing to install;
+  about 25 MB for the whole UI. Close minimises it (Jarvis keeps running);
+  right-click for "Quit Jarvis". It hides while the computer agent works.
+  `JARVIS_NO_WINDOW=1` turns it off.
 - **Console UI** (`listener/ui.py`) — live ring, STT/TTS status, latency and
   turn counter, rerouted logs, and an overlay log viewer (`Ctrl+L`, arrows to
   scroll, `Esc` to close). Auto-disables when stdout isn't a terminal or
@@ -92,6 +99,7 @@ No manual download step.
 | `AGENT_THINKING` | Gemini thinking level for the computer agent; default `low` | optional |
 | `AGENT_MAX_STEPS` | step limit per computer task; default `30` | optional |
 | `AGENT_TIMEOUT` | time limit per computer task in seconds; default `300` | optional |
+| `JARVIS_NO_WINDOW` | set non-empty to skip the desktop window | optional |
 | `JARVIS_NO_UI` | set non-empty to force the terminal UI off | optional |
 | `JARVIS_NO_TYPING` | set non-empty to disable typed input (voice still works) | optional |
 | `DEV_LOG` | `1` writes a detailed machine log to `dev_log.txt` (every STT/TTS/thinking/action event with timings, aligned columns) | optional |

@@ -63,6 +63,7 @@ from listener import tts_fish
 from listener import tts_moonshine
 from listener import tts
 from listener import ui
+from listener import window_ui
 from listener.audio_out import get_stream as get_output_stream, close_stream
 from commands import agent
 from commands import chat
@@ -1424,6 +1425,10 @@ def main():
     # Returns False when there's no console to read keystrokes from (piped
     # output, IDE run pane, JARVIS_NO_TYPING set) -- voice still works.
     typing = console_input.start()
+    # The desktop window (listener/window_ui.py): its input box feeds the same
+    # queue as the console, so typed turns work even with no console reader.
+    if window_ui.start():
+        typing = True
 
     ui.set_state(ui.LISTENING)
     _banner(typing)
