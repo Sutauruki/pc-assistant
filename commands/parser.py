@@ -233,8 +233,19 @@ about solar panels in Chrome", "fill in this form", "find the cheapest flight
 to Lagos on Google Flights", "click the blue button", "type hello in the search
 box". Put the user's full request in "task", keeping names, message wording
 and every detail exactly as said -- the agent can't ask you what they meant.
+Pressing keys or shortcuts ("press Windows R", "press ctrl s", "hit enter")
+and clicking or typing in whatever is on screen are computer_task too -- never
+"chat": chat can't press anything, and answering a request to DO something
+with a chat reply leaves the user believing it was done.
 Never use it for things a dedicated action does (opening an app, volume,
-files, a quick web question -- web_search is much faster). Mode "command":
+files, a quick web question -- web_search is much faster).
+ANSWERING THE AGENT: when your previous reply (in the history) was a QUESTION
+the agent asked mid-task -- "which window has the search box?", "who should I
+message?" -- the user's next words are the answer, not a new command. Emit
+computer_task again with the ORIGINAL task plus their answer folded in:
+history "type 12345678 into the search box" / "Which app has the search box?",
+user "chrome" -> {"action": "computer_task", "task": "type 12345678 into the
+search box in Chrome"}. Not open_app. Mode "command":
 the agent speaks its own result, and asks for approval itself before it sends
 or submits anything.
 "research_explain" and "research_save" follow up a research computer_task,
@@ -699,6 +710,57 @@ def _clean_actions(raw):
 
 # --- The parse -------------------------------------------------------------
 
+# Room for the JSON answer plus gpt-oss's reasoning at "low" effort. Groq
+# counts max_tokens toward the free tier's tokens-per-minute budget before the
+# request runs; left unset it defaults to the model's maximum, which on top of
+# this ~6k-token prompt is what produced "413 Request too large".
+MAX_TOKENS = 1024
+# Shorter reasoning: a router picks one of a few dozen shapes, it doesn't need
+# to deliberate -- and gpt-oss's default effort is where 20-30s parses came from.
+REASONING_EFFORT = os.getenv("PARSER_REASONING", "low")
+
+
+def _open_stream(messages, t0):
+    """(stream, None) from Groq, or (None, text) from the genbrain chain
+    (Gemini, then OpenRouter) when Groq refuses -- a 413/429 on the free tier
+    shouldn't turn a command into a chat turn that pretends to have done it.
+    (None, None) when nothing answered at all."""
+    from commands import devlog
+    client = get_client()
+    attempts = [{"extra_body": {"reasoning_effort": REASONING_EFFORT}}, {}]
+    last = None
+    for extra in attempts:
+        try:
+            return client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                response_format={"type": "json_object"},
+                temperature=0.2,
+                max_tokens=MAX_TOKENS,
+                stream=True,
+                **extra
+            ), None
+        except Exception as e:
+            last = e
+            # Only the reasoning option can be retried away; anything else
+            # (rate limit, size, network) goes straight to the fallback.
+            if "reasoning" not in str(e).lower():
+                break
+    print("parser: Groq failed ({}), trying the fallback chain".format(last))
+    devlog.route("reach", "FAIL", str(last)[:120], seconds=time.time() - t0)
+    try:
+        from commands import genbrain
+        convo = "\n".join("{}: {}".format(m["role"].upper(), m["content"])
+                          for m in messages[1:])
+        text = genbrain._chain_text(messages[0]["content"],
+                                    convo + "\nReturn the JSON object for the last USER message.",
+                                    MAX_TOKENS, json_mode=True)
+        devlog.route("reach", "OK", "fallback chain", seconds=time.time() - t0)
+        return None, text
+    except Exception as e:
+        print("parser: fallback chain failed too ({})".format(e))
+        return None, None
+
 def parse_command(text, on_reply=None, on_mode=None):
     """Takes transcribed text, returns (mode, actions, reply).
 
@@ -729,23 +791,26 @@ def parse_command(text, on_reply=None, on_mode=None):
     messages.extend(_history_messages())
     messages.append({"role": "user", "content": text})
 
-    try:
-        stream = get_client().chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            response_format={"type": "json_object"},
-            temperature=0.2,
-            stream=True,
-        )
-    except Exception as e:
-        print("parser: couldn't reach the model ({})".format(e))
-        devlog.route("reach", "FAIL", str(e)[:120], seconds=time.time() - t0)
-        return "chat", [], "I couldn't reach my language model just then."
+    stream, fallback_text = _open_stream(messages, t0)
 
     buf = ""
     mode = None
     reply = None
     aborted = False
+
+    if stream is None:
+        if fallback_text is None:
+            return "chat", [], "I couldn't reach my language model just then."
+        # Not streamed, so the early callbacks fire here instead.
+        buf = fallback_text
+        found = _extract_string_value(buf, "reply")
+        if found and on_reply is not None:
+            reply = found
+            try:
+                on_reply(reply)
+            except Exception as e:
+                print("parser: on_reply raised ({})".format(e))
+        stream = ()
 
     try:
         for chunk in stream:
@@ -787,7 +852,8 @@ def parse_command(text, on_reply=None, on_mode=None):
         # open until the SDK's socket times out. One of those per chat turn
         # adds up over a session.
         try:
-            stream.close()
+            if hasattr(stream, "close"):
+                stream.close()
         except Exception:
             pass
 

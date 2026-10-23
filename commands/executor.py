@@ -54,7 +54,6 @@ from commands import website_builder
 from commands import window_actions
 from commands import youtube_video
 
-SCREENSHOTS_DIR = "screenshots"
 
 # Kick the app scan off now rather than on the first spoken command. This
 # module is imported at startup, so the ~1-3s PowerShell round trip overlaps
@@ -63,6 +62,24 @@ app_index.preload()
 
 
 def open_app(target):
+    # Shells, registry, Task Manager, Settings and the like open only after a
+    # typed yes (commands/pc_policy.py decides what counts, by what the name
+    # actually resolves to -- fuzzy matching can turn "shell" into PowerShell).
+    from commands import confirm, pc_policy
+    entry, _score = app_index.resolve(target)
+    if entry is None:
+        entry = app_index._fallback_entry(target)
+    if entry is not None:
+        reason = pc_policy.blocked_app_entry(entry.name, entry.path)
+        if reason:
+            return confirm.request(
+                "{} can change system settings, so I need you to confirm. To open "
+                "it, type yes in my window or click Yes on the notification."
+                .format(entry.name),
+                lambda: app_index.open_app(target),
+                label="open: {}".format(entry.name),
+                physical=True,
+            )
     msg = app_index.open_app(target)
     print(msg)
     return msg
@@ -97,14 +114,17 @@ def set_volume(value):
 
 
 def take_screenshot():
+    # Documents/Jarvis/Screenshots/<date> <time>.png -- alongside everything
+    # else Jarvis makes, not in whatever folder Jarvis happened to start in.
     try:
-        os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
-        filename = f"screenshot_{time.strftime('%Y%m%d_%H%M%S')}.png"
-        filepath = os.path.join(SCREENSHOTS_DIR, filename)
+        from commands import paths
+        filepath = str(paths.output_path(
+            paths.jarvis_dir("Screenshots") / time.strftime("%Y-%m-%d %H-%M-%S"),
+            ".png"))
         with mss.mss() as sct:
             screenshot = sct.grab(sct.monitors[0])
             mss.tools.to_png(screenshot.rgb, screenshot.size, output=filepath)
-        msg = "Screenshot taken"
+        msg = "Screenshot saved to {}".format(paths.display(os.path.dirname(filepath)))
     except Exception as e:
         msg = f"Failed to take screenshot: {e}"
 

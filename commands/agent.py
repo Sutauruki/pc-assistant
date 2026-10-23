@@ -31,7 +31,7 @@ SECURITY -- enforced here in code, not left to the model
   screen -- so a web page can't talk its way past it. If that check can't run,
   the step needs your keypress instead.
 - Risky steps (send, post, submit, pay, delete, download, Enter in a chat
-  box...) need a PHYSICAL F8 from you. Jarvis says exactly what it's about to
+  box...) need a PHYSICAL Ctrl+Enter (or F8) from you. Jarvis says exactly what it's about to
   do, including the text it typed, first. Voice can't approve -- a video
   playing "yes" can't send your messages.
 - Esc, the mouse slammed into the top-left corner, or moving the mouse
@@ -303,10 +303,13 @@ def _on_task(task, description, cache):
     content = "TASK: {}\nACTION: {}".format(json.dumps(task), json.dumps(description))
     verdict = None
     try:
+        # Room for the reasoning gpt-oss does before its one-word answer: with
+        # 5 tokens it ran out mid-thought, the check "failed", and every
+        # open_url/open_app fell back to asking for a keypress.
         if os.getenv("GROQ_API_KEY"):
-            text = genbrain._groq_text(_ON_TASK_SYSTEM, content, 5)
+            text = genbrain._groq_text(_ON_TASK_SYSTEM, content, 400)
         else:
-            text = genbrain._gemini_text(_ON_TASK_SYSTEM, content, 5)
+            text = genbrain._gemini_text(_ON_TASK_SYSTEM, content, 50)
         word = text.strip().lower().lstrip("\"'*` ")
         if word.startswith("yes"):
             verdict = True
@@ -377,7 +380,8 @@ class _Run(object):
         self.cursor = None
 
     def approve(self, kind, why, description, about_to):
-        """Say exactly what's about to happen, then wait for a physical F8."""
+        """Say exactly what's about to happen, then wait for a physical
+        Ctrl+Enter (or F8)."""
         detail = description
         if self.last_typed and kind != "type":
             detail += '. The text I typed is: "{}"'.format(self.last_typed[:300])
@@ -387,16 +391,16 @@ class _Run(object):
         try:
             from commands import notify
             notify.notify("Jarvis needs your OK",
-                          "{} -- F8 to approve, Esc to stop".format(detail[:200]))
+                          "{} -- Ctrl+Enter to approve, Esc to stop".format(detail[:200]))
         except Exception:
             pass
-        # Arm before speaking, so an F8 pressed while Jarvis is still talking
-        # counts.
+        # Arm before speaking, so a Ctrl+Enter pressed while Jarvis is still
+        # talking counts.
         self.guard.reset_approval()
-        _say("Before I go on: I'm about to {}. Press F8 to approve, or Escape "
-             "to stop.".format(detail))
+        _say("Before I go on: I'm about to {}. Press Control Enter to approve, "
+             "or Escape to stop.".format(detail))
         ok = self.guard.wait_for_approval(APPROVAL_SECONDS, clear=False)
-        _audit("approval", "YES (F8)" if ok else "NO")
+        _audit("approval", "YES (key)" if ok else "NO")
         if not ok:
             self.guard.check()  # Esc -> Stopped
             raise _Declined(description)

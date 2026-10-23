@@ -173,6 +173,14 @@ def known_folders():
     return _folders
 
 
+def jarvis_dir(kind=None):
+    """Where Jarvis keeps what it makes: Documents/Jarvis, with one folder per
+    kind -- Documents, Presentations, Spreadsheets, PDFs, Sites, Screenshots.
+    Not created here; output_path() makes the folder when a file lands."""
+    base = Path(known_folders()["documents"]) / "Jarvis"
+    return base / kind if kind else base
+
+
 # Spoken names that mean one of the above. Kept small on purpose -- the model
 # is told to emit these words, so this is a normaliser, not a guessing game.
 _ROOT_ALIASES = {

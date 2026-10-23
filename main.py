@@ -476,7 +476,7 @@ class _Voice:
         self._thread = None
 
 
-def _resolve_confirmation(text, voice):
+def _resolve_confirmation(text, voice, typed=False):
     """Handles a turn that is an answer to a parked question.
 
     Returns True if the text was consumed as an answer. None from interpret()
@@ -486,6 +486,16 @@ def _resolve_confirmation(text, voice):
     """
     question = confirm.question()
     verdict = confirm.interpret(text)
+
+    if verdict is True and confirm.needs_physical() and not typed:
+        # A spoken yes can't approve this one (confirm.py, PHYSICAL
+        # CONFIRMATIONS). Keep it pending and say how to approve it.
+        line = ("For safety I can't take a spoken yes for that. Type yes in my "
+                "window, or click Yes on the notification.")
+        print("confirm: spoken yes refused for a physical confirmation")
+        ui.set_reply(line)
+        voice.say(line, background=False)
+        return True
 
     if verdict is True:
         print("confirm: yes -> {}".format(question))
@@ -675,7 +685,7 @@ def _run_turn(text, t_start, marks):
 
     # A parked question owns the next thing said, whatever it was going to be.
     if confirm.is_pending():
-        if _resolve_confirmation(text, voice):
+        if _resolve_confirmation(text, voice, typed=bool(marks.get("typed"))):
             _finish(marks, t_start)
             return
 
@@ -785,8 +795,11 @@ def _run_turn(text, t_start, marks):
         remember(text, answer or reply)
         unspoken = []
     else:
-        remember(text, reply)
         spoken, unspoken = _partition_results(ordered, results)
+        # The router's history gets what was actually said back -- for the
+        # agent that's its result or its question ("which window has the
+        # search box?"), and the next turn's answer only makes sense with it.
+        remember(text, " ".join(spoken) if spoken else reply)
         if spoken:
             line = " ".join(spoken)
             print('Jarvis reports: "{}"'.format(line))
@@ -987,7 +1000,9 @@ def handle_typed(text):
     fastest way to test a change.
     """
     t_start = time.perf_counter()
-    marks = {}
+    # "typed" isn't a timing: it tells _run_turn the words came off the
+    # keyboard, which is what a physical confirmation needs (confirm.py).
+    marks = {"typed": True}
     devlog.wake("typed", detail="...{}".format(text[-80:]) if len(text) > 80 else text)
 
     ui.set_state(ui.THINKING)
@@ -1291,7 +1306,29 @@ def _listen_loop(model, typing):
             raise
 
 
+def _clear_terminal():
+    """Wipes the console -- screen and scrollback -- so Jarvis's panel sits
+    alone, with none of the shell history or startup chatter above it.
+    Only when stdout is a real terminal; a pipe or log file is left alone."""
+    try:
+        if not sys.stdout.isatty():
+            return
+    except Exception:
+        return
+    if os.name == "nt":
+        os.system("cls")
+    # \x1b[3J clears the scrollback too (Windows Terminal, VS Code and most
+    # POSIX terminals); \x1b[2J\x1b[H the visible screen and cursor.
+    sys.stdout.write("\x1b[3J\x1b[2J\x1b[H")
+    sys.stdout.flush()
+
+
 def main():
+    _clear_terminal()
+    if os.name == "nt":
+        os.system("title Jarvis")
+    print("Starting Jarvis...")
+
     # A provider reply is spoken, and it is also printed. The Windows console
     # defaults to cp1252, and model text carries characters it cannot encode
     # (curly quotes, non-breaking hyphens) -- a print() that raises on that
@@ -1343,6 +1380,11 @@ def main():
                    tts_moonshine.available(), tts_moonshine.VOICE))
 
     ui.set_engine(tts=tts.primary_engine())
+    # Second wipe: model loading above prints native chatter (openwakeword,
+    # PortAudio) that nothing else can catch. The panel starts on a clean
+    # screen. Without the panel (JARVIS_NO_UI) the startup log is kept.
+    if not os.environ.get("JARVIS_NO_UI"):
+        _clear_terminal()
     ui.start()  # no-op when stdout isn't a terminal, or JARVIS_NO_UI is set
 
     # After ui.start(), because it draws the prompt row through the panel.

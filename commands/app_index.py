@@ -348,6 +348,12 @@ def _expand_alias(query):
 # Catalog entries
 # ---------------------------------------------------------------------------
 
+def _is_web_app(args):
+    """A browser shortcut that opens a site as an app (Chrome/Edge PWAs)."""
+    lowered = (args or "").lower()
+    return "--app-id=" in lowered or "--app=" in lowered
+
+
 class AppEntry(object):
     __slots__ = ("name", "path", "args", "appid", "sources", "keys")
 
@@ -369,7 +375,11 @@ class AppEntry(object):
             if expanded != norm:
                 keys.add(expanded)
 
-        if self.path:
+        # The exe's own name is a key -- except for browser web-app shortcuts
+        # ("Lagos Life" is chrome.exe --app-id=...). Those launch chrome.exe
+        # too, so the stem would make every one of them a perfect match for
+        # "chrome" and the first one found would open instead of Chrome.
+        if self.path and not _is_web_app(self.args):
             base = os.path.splitext(os.path.basename(self.path))[0]
             stem = _normalize(_split_camel(base))
             if stem:
@@ -1018,6 +1028,15 @@ def resolve(spoken):
                     break
             if score >= 1.0:
                 break
+        # Two perfect matches: the one whose display NAME is what was said
+        # ("chrome" -> "Google Chrome" over a shortcut that only shares the
+        # exe) wins; a web-app shortcut never beats a real app.
+        if score >= 1.0:
+            name = _normalize(entry.name)
+            if name in queries or any(q and name.endswith(" " + q) for q in queries):
+                score += 0.02
+            if _is_web_app(entry.args):
+                score -= 0.01
 
         # A tie between two equally-named entries goes to the one we can also
         # close later -- a real .exe path gives us a process name to match.

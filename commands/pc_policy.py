@@ -52,6 +52,16 @@ SENSITIVE_TITLE_WORDS = {
     "password manager", "passwords", "online banking", "paypal", "revolut",
     "crypto wallet", "metamask", "seed phrase", "recovery phrase",
     "private key", "authenticator",
+    # payment dashboards and processors
+    "paystack", "flutterwave", "stripe", "payoneer", "remita", "interswitch",
+    "quickteller", "monnify", "transactions", "payouts",
+    # Nigerian banks and fintechs
+    "gtbank", "gtco", "access bank", "zenith", "zenith bank", "uba",
+    "first bank", "firstbank", "fcmb", "wema", "alat", "stanbic", "ecobank",
+    "union bank", "polaris", "providus", "kuda", "opay", "palmpay",
+    "moniepoint", "piggyvest", "cowrywise", "chipper",
+    # exchanges and brokers
+    "binance", "coinbase", "bybit", "luno", "trove",
 }
 
 

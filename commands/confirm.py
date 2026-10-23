@@ -20,6 +20,14 @@ Only one thing can be pending at a time. Two stacked confirmations would mean
 speaking two questions and hoping the yes lands on the right one, so a second
 request replaces the first and says so.
 
+PHYSICAL CONFIRMATIONS
+----------------------
+request(..., physical=True) marks a question that a spoken "yes" can't
+answer: it needs a typed "yes" in Jarvis's window or the toast's Yes button.
+Used for shell commands off the safe list and for opening protected system
+apps -- the things where audio from a video or a call saying "hey Jarvis...
+yes" would otherwise be enough to change your machine. main.py enforces it.
+
 FAIL-SAFE, NOT FAIL-QUIET
 -------------------------
 An answer that isn't clearly yes is not a yes. interpret() returns None for
@@ -40,12 +48,13 @@ _lock = threading.Lock()
 _pending = None
 
 
-def request(question, run, label=None):
+def request(question, run, label=None, physical=False):
     """Park `run` until someone says yes. Returns the question to speak.
 
     question: a full spoken sentence ending in a question mark.
     run:      zero-argument callable returning a result string.
     label:    short description for logs and the dashboard.
+    physical: only a typed yes or the toast button counts, never voice.
     """
     global _pending
 
@@ -53,6 +62,7 @@ def request(question, run, label=None):
         "question": question,
         "run": run,
         "label": label or question,
+        "physical": bool(physical),
         "created": time.time(),
     }
 
@@ -93,6 +103,13 @@ def question():
     with _lock:
         entry = _live()
         return entry["question"] if entry else None
+
+
+def needs_physical():
+    """True when the pending question can't be answered by voice."""
+    with _lock:
+        entry = _live()
+        return bool(entry and entry.get("physical"))
 
 
 def clear():

@@ -14,12 +14,18 @@ a chat box, never "send". Pressing Enter on its own is a separate, checked step
 THE BRAKES (Guard)
 ------------------
 A low-level keyboard hook watches the PHYSICAL keyboard while a task runs:
-  Esc   -> stop the task immediately (and cancel any pending approval)
-  F8    -> approve the one risky step Jarvis is waiting on
+  Esc          -> stop the task immediately (and cancel any pending approval)
+  Ctrl+Enter   -> approve the one risky step Jarvis is waiting on
+  F8           -> the same, for keyboards where F-keys work without Fn
 Windows marks synthetic keystrokes as injected (LLKHF_INJECTED), and the hook
 ignores those -- so the agent pressing Esc to close a popup doesn't stop it,
 and nothing the agent types, and no web page, can ever approve a risky step.
 Only a finger on a key can.
+
+While an approval is pending, the approval and stop keys are SWALLOWED: they
+reach Jarvis and nothing else. Otherwise your Ctrl+Enter would also land in
+the app in front -- where in Slack, Teams or a form it means "send" or
+"submit" on its own.
 
 Slamming the mouse into the top-left corner of the screen also stops it, and
 commands/agent.py stops when the cursor has moved since its last action --
@@ -56,6 +62,8 @@ WM_QUIT = 0x0012
 LLKHF_INJECTED = 0x10
 VK_ESCAPE = 0x1B
 VK_F8 = 0x77
+VK_RETURN = 0x0D
+VK_CONTROL = 0x11
 
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
@@ -258,6 +266,7 @@ class Guard(object):
     def __init__(self):
         self._stop = threading.Event()
         self._approve = threading.Event()
+        self._pending = threading.Event()
         self._done = threading.Event()
         self._ready = threading.Event()
         self.reason = ""
@@ -300,47 +309,69 @@ class Guard(object):
 
     # -- approval ---------------------------------------------------------
     def reset_approval(self):
-        """Forget any earlier F8, so only one pressed from now on counts."""
+        """Forget any earlier approval keypress and start swallowing the
+        approval keys, so only one pressed from now on counts."""
         self._approve.clear()
+        self._pending.set()
         if not self.hooked:
-            _user32.GetAsyncKeyState(VK_F8)  # clear the "pressed since" bit
+            _user32.GetAsyncKeyState(VK_F8)  # clear the "pressed since" bits
+            _user32.GetAsyncKeyState(VK_RETURN)
+
+    def _physical_approval_polled(self):
+        """Fallback when the hook isn't installed: real key state. The agent
+        is paused while it waits, so nothing is being injected right now --
+        and it can never press F8 at all (not in pc_policy.ALLOWED_KEYS)."""
+        if _user32.GetAsyncKeyState(VK_F8) & 0x8000:
+            return True
+        return bool(_user32.GetAsyncKeyState(VK_RETURN) & 0x8000
+                    and _user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
 
     def wait_for_approval(self, timeout, clear=True):
-        """True only if a PHYSICAL F8 arrives within `timeout` seconds (or
-        since reset_approval(), when clear=False). Physical Esc, timeout, or
-        a stop all count as no.
-
-        Without the hook we can't tell your F8 from an injected one, so the
-        fallback polls the real key state -- the agent can never press F8 (it
-        isn't in pc_policy.ALLOWED_KEYS), so it's still yours alone."""
+        """True only if a PHYSICAL Ctrl+Enter (or F8) arrives within
+        `timeout` seconds -- or since reset_approval(), when clear=False.
+        Physical Esc, timeout, or a stop all count as no."""
         if clear:
             self.reset_approval()
         deadline = time.time() + timeout
-        while time.time() < deadline:
-            if self._stop.is_set():
-                return False
-            if self._approve.is_set():
-                return True
-            if not self.hooked and _user32.GetAsyncKeyState(VK_F8) & 0x8000:
-                return True
-            time.sleep(0.05)
-        return False
+        try:
+            while time.time() < deadline:
+                if self._stop.is_set():
+                    return False
+                if self._approve.is_set():
+                    return True
+                if not self.hooked and self._physical_approval_polled():
+                    return True
+                time.sleep(0.05)
+            return False
+        finally:
+            self._pending.clear()
 
     # -- watchers ---------------------------------------------------------
     def _hook_loop(self):
         self._thread_id = _kernel32.GetCurrentThreadId()
 
         def callback(n_code, w_param, l_param):
+            swallow = False
             try:
                 if n_code == 0 and w_param in (WM_KEYDOWN, WM_SYSKEYDOWN):
                     info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                     if not info.flags & LLKHF_INJECTED:
+                        pending = self._pending.is_set()
                         if info.vkCode == VK_ESCAPE:
                             self.stop("you pressed Esc")
+                            swallow = pending
                         elif info.vkCode == VK_F8:
+                            if pending:
+                                self._approve.set()
+                                swallow = True
+                        elif info.vkCode == VK_RETURN and pending and \
+                                _user32.GetAsyncKeyState(VK_CONTROL) & 0x8000:
                             self._approve.set()
+                            swallow = True
             except Exception:
                 pass
+            if swallow:
+                return 1  # handled: don't pass it on to the app in front
             return _user32.CallNextHookEx(None, n_code, w_param, l_param)
 
         self._proc = HOOKPROC(callback)  # keep a reference: Windows calls it

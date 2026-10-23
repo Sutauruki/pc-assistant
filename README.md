@@ -124,7 +124,7 @@ No manual download step.
 | `executor.py` | action execution (worker threads) |
 | `screen_actions.py` | screen understanding (active monitor → 1024px JPEG, passwords masked → Gemini, streamed) |
 | `agent.py` | computer agent: look → decide → check → act loop |
-| `agent_input.py` | real mouse/keyboard input (SendInput) + Esc/F8/corner brakes |
+| `agent_input.py` | real mouse/keyboard input (SendInput) + Esc, Ctrl+Enter approval, corner brakes |
 | `uia.py` | Windows UI Automation: every on-screen control and its position |
 | `desktop.py` | foreground window, its process and monitor |
 | `pc_policy.py` | security policy: private / protected windows, risky steps, banned keys, URLs, text |
@@ -160,7 +160,7 @@ PC alone while it works** — it's quicker to watch than to fight it.
 | **Esc** (physical key) | stops the task immediately |
 | Slam the mouse into the **top-left corner** | stops the task |
 | Move the mouse yourself | stops the task — you've taken over |
-| **F8** (physical key) | approves the one risky step it just described |
+| **Ctrl+Enter** (physical keys; **F8** also works) | approves the one risky step it just described |
 
 **What it will never do, whatever a web page or message says**
 
@@ -180,16 +180,23 @@ PC alone while it works** — it's quicker to watch than to fight it.
 - **Run code** — the AI picks from a fixed list of actions (click, type,
   press, scroll, open app/URL, note, done...). It never writes or runs code.
 
-**What needs your F8 first** — sending, posting, submitting, buying, paying,
+**What needs your Ctrl+Enter first** — sending, posting, submitting, buying, paying,
 deleting, downloading, installing, sharing, calling, and pressing Enter in a
 chat box (that's "send" on WhatsApp). Jarvis says exactly what it's about to
-do — including the message it typed — then waits 30 seconds for F8. A spoken
+do — including the message it typed — then waits 30 seconds for Ctrl+Enter. While it waits, those keys go only to
+Jarvis -- they don't also reach the app in front. A spoken
 "yes" doesn't count, so audio from a video can't approve anything.
 
 **Prompt injection** — screen text goes to the AI marked as untrusted data,
 and typing, opening apps or URLs, and every risky step are checked against
 your original request by a second AI call that never sees the screen. Off-task
-steps are blocked; if that check can't run, the step needs your F8 instead.
+steps are blocked; if that check can't run, the step needs your Ctrl+Enter instead.
+
+**Direct commands too** — outside the agent, opening a protected system app
+("open PowerShell") or running a shell command that isn't on the read-only
+safe list asks first, and that question only takes a **typed** "yes" in
+Jarvis's window or the notification's Yes button, never a spoken one.
+Read-only commands on the safe list (like `dir`) run straight away.
 
 **Limits and records** — at most `AGENT_MAX_STEPS` steps and `AGENT_TIMEOUT`
 seconds per task. Every step is appended to `agent_log.txt` (typed text
@@ -203,6 +210,24 @@ anything stricter use a paid Gemini key, whose data isn't used that way.
 **If Chrome pages show no numbered boxes** — Chrome exposes page contents to
 Windows accessibility on demand; if it doesn't on your machine, start Chrome
 with `--force-renderer-accessibility` (add it to the shortcut's Target).
+
+## Where files go
+
+Everything Jarvis makes lands in `Documents\Jarvis`, one folder per kind:
+
+| Folder | What |
+|---|---|
+| `Documents` | Word documents |
+| `Presentations` | slide decks |
+| `Spreadsheets` | Excel files |
+| `PDFs` | PDF reports |
+| `Sites` | generated websites |
+| `Screenshots` | screenshots |
+
+Unnamed files are dated so they sort in order (`2026-10-23 Queue Theory.docx`);
+a name you give is used as is ("called Q3 report" → `Q3 report.pdf`). Say a
+folder to put it elsewhere ("...in downloads", "...on my desktop"). Nothing
+is ever overwritten -- a clash gets `(2)`.
 
 ## How a turn flows
 

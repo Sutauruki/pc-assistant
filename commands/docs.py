@@ -19,6 +19,9 @@ as everything else -- and the "couldn't" wording below is what lets main.py
 know the turn failed.
 """
 
+import os
+import re
+import time
 from pathlib import Path
 
 from commands import genbrain
@@ -91,32 +94,68 @@ def _slug(title):
     return " ".join(safe.split())
 
 
+# One folder per kind under Documents/Jarvis (paths.jarvis_dir).
+_KIND_FOLDERS = {".docx": "Documents", ".pptx": "Presentations",
+                 ".xlsx": "Spreadsheets", ".pdf": "PDFs"}
+
+# "Q3 report in documents", "notes on my desktop", "in downloads"
+_IN_FOLDER = re.compile(
+    r"^(?:(?P<name>.*?)\s+)?(?:in|into|inside|on|to|under)\s+(?P<folder>.+)$", re.I)
+_CALLED = re.compile(r"^(?:called|named|titled|name it|call it)\s+", re.I)
+
+
+def _folder_like(spec):
+    """The folder a spoken spec names, or None if it isn't one we can trust:
+    a known folder (desktop, documents, downloads...), an absolute path, or a
+    folder that already exists."""
+    if not spec:
+        return None
+    resolved = paths.resolve(spec)
+    head = paths._strip_filler(paths.normalise(spec).split(os.sep)[0]).lower()
+    if head in paths._ROOT_ALIASES or os.path.isabs(paths.normalise(spec)) or resolved.is_dir():
+        return resolved
+    return None
+
+
 def destination_path(target, title, extension=_FILE_EXT):
     """Where a generated file (doc / deck / sheet / pdf) should land.
 
-    Shared convention across the generator modules: a spoken target like "called
-    Q3 report in documents" or a partial path is resolved by paths.py like any
-    other location; failing that the file lands in Documents/Jarvis under a safe
-    slug of the title. `extension` is that module's own suffix.
+    The organised default is Documents/Jarvis/<Kind>/<date> <title>.<ext>:
+    one folder per kind, names that sort by date. When the user named the
+    file, their name is used as is; when they named a folder ("in
+    documents", "on my desktop", a full path), it goes there. A bare name is
+    never resolved against the home folder -- that's how files used to end up
+    loose in C:\\Users\\<you>.
     """
-    spec = (target or "").strip()
-    base = None
+    default_dir = paths.jarvis_dir(_KIND_FOLDERS.get(extension, "Documents"))
+    spec = _CALLED.sub("", (target or "").strip().strip(".")).strip()
 
-    if spec:
-        resolved = paths.resolve(spec)
-        if resolved.suffix:
-            return paths.output_path(resolved, extension)
-        # No extension = a folder or a bare name. If it resolves to something
-        # directory-like, use it; otherwise treat it as a new filename.
-        if resolved.is_dir():
-            base = resolved
-        elif resolved.parent != resolved:
-            return paths.output_path(resolved, extension)
+    name, folder = spec, None
+    match = _IN_FOLDER.match(spec) if spec else None
+    if match:
+        candidate = _folder_like(match.group("folder"))
+        if candidate is not None:
+            name, folder = (match.group("name") or "").strip(), candidate
+            name = _CALLED.sub("", name).strip()
 
-    if base is None:
-        base = Path(paths.known_folders()["documents"]) / "Jarvis"
+    base = folder or default_dir
+    if name:
+        spoken = paths.normalise(name)
+        head = paths._strip_filler(spoken).lower()
+        if os.sep not in spoken and head in paths._ROOT_ALIASES:
+            base = paths.resolve(spoken)                  # just a folder: "desktop"
+        elif os.path.isabs(spoken) or os.sep in spoken:
+            # A path. Known roots ("desktop/notes") resolve as usual; anything
+            # else is relative to the Jarvis folder, never the home folder.
+            return paths.output_path(paths.resolve(spoken, base=base), extension)
+        else:
+            if spoken.lower().endswith(extension):
+                spoken = spoken[:-len(extension)]
+            stem = _slug(spoken)
+            if stem:
+                return paths.output_path(base / stem, extension)
 
-    stem = _slug(title or "document") or "document"
+    stem = "{} {}".format(time.strftime("%Y-%m-%d"), _slug(title or "document") or "document")
     return paths.output_path(base / stem, extension)
 
 

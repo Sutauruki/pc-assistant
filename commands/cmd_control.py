@@ -542,13 +542,17 @@ def run(command, cwd=None, force=False):
     # correctly there. This call site used "It {}", which turned the commonest
     # one into "It git commit changes things" -- spoken aloud, every single time
     # you run a write command. Same phrases, one connective that fits them.
-    question = "That would run: {}. I'm asking because {}. Should I?".format(
+    # physical=True: a shell command is the one thing a spoofed "yes" (a
+    # video, a call) must never be able to run -- see confirm.py.
+    question = ("That would run: {}. I'm asking because {}. To allow it, type "
+                "yes in my window or click Yes on the notification.").format(
         _spoken_form(command), reason
     )
     return confirm.request(
         question,
         lambda: _execute(command, cwd),
         label="run: {}".format(command),
+        physical=True,
     )
 
 
