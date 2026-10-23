@@ -34,8 +34,8 @@ import mss
 import mss.tools
 from pycaw.pycaw import AudioUtilities
 
+from commands import agent
 from commands import app_index
-from commands import browser_automation
 from commands import clipboard_actions
 from commands import cmd_control
 from commands import docs
@@ -45,6 +45,7 @@ from commands import locate
 from commands import memory
 from commands import notify as notifications
 from commands import pdf_export
+from commands import research
 from commands import screen_actions
 from commands import sheets
 from commands import slides
@@ -331,10 +332,23 @@ def _run_one(action):
             _first(action, "query", "target", "text"),
             _first(action, "question", "ask", "detail", default=""),
         )
-    if kind == "browser_run":
+
+    # --- computer control (commands/agent.py) -------------------------------
+    # browser_run is the old name; the agent drives your real browser now.
+    if kind in ("computer_task", "browser_run"):
         return _call(
-            browser_automation.browser_run,
-            _first(action, "instruction", "text", "prompt", "task"),
+            agent.run_task,
+            _first(action, "task", "instruction", "text", "prompt"),
+        )
+    if kind == "research_explain":
+        return _call(
+            research.explain, _first(action, "question", "query", default="")
+        )
+    if kind == "research_save":
+        return _call(
+            research.save,
+            _first(action, "format", "as", "type", default="doc"),
+            _first(action, "target", "name", "where", default=""),
         )
     if kind == "build_website":
         return _call(

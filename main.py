@@ -64,6 +64,7 @@ from listener import tts_moonshine
 from listener import tts
 from listener import ui
 from listener.audio_out import get_stream as get_output_stream, close_stream
+from commands import agent
 from commands import chat
 from commands import cmd_control
 from commands import confirm
@@ -140,7 +141,16 @@ SPOKEN_RESULTS = {
     # Tier 6: the result is the answer, a read that comes back as prose.
     "analyze_file", "youtube_summary", "web_search", "browser_run",
     "stop_preview",
+    # The computer agent speaks its own result (and its own approval
+    # questions, mid-task); research_explain's result is the explanation.
+    "computer_task", "research_explain",
 }
+
+# Actions whose result is already a finished spoken answer. In mode "both"
+# these skip the second pass through the chat model that would only
+# paraphrase them -- a whole extra model round trip for nothing.
+DIRECT_ANSWERS = {"computer_task", "browser_run", "research_explain",
+                  "research_save", "understand_screen"}
 
 # How many times to re-record for an answer to a pending confirmation before
 # giving up on it. Two is enough for one misheard reply; more than that and
@@ -707,6 +717,19 @@ def _run_turn(text, t_start, marks):
         _chat_turn(text, t_start, marks, voice)
         return
 
+    kinds_here = {a.get("action") for a in actions if isinstance(a, dict)}
+    if actions and kinds_here == {"understand_screen"}:
+        if reply and not route["spoke"]:
+            route["spoke"] = True
+            ui.set_reply(reply)
+            voice.say(reply)
+        _screen_turn(text, actions, t_start, marks, voice)
+        return
+    if mode == "both" and actions and kinds_here <= DIRECT_ANSWERS:
+        mode = "command"  # the results are the answer; speak them as-is
+    if kinds_here & {"computer_task", "browser_run"}:
+        _agent_hooks(voice)
+
     # Safety net for a model that ignored the key ordering, or that routed to
     # chat and then changed its mind -- either way on_reply never spoke. The
     # flag is what keeps this from saying the line a second time.
@@ -817,6 +840,52 @@ def _run_turn(text, t_start, marks):
         notify.notify("Heads up", correction)
 
     _finish(marks, t_start)
+
+
+def _screen_turn(text, actions, t_start, marks, voice):
+    """"What's on my screen": the vision model's answer streams straight into
+    the voice, sentence by sentence, instead of arriving whole and then being
+    paraphrased by the chat model -- that was two model calls back to back
+    before the first word."""
+    from commands import screen_actions
+
+    ui.set_state(ui.THINKING)
+    question = " ".join(
+        str(a.get("question") or a.get("query") or a.get("text") or "")
+        for a in actions if isinstance(a, dict)
+    ).strip() or text
+
+    def produce(put):
+        return screen_actions.understand_screen(question, on_sentence=put)
+
+    try:
+        answer = voice.stream(produce)
+    except Exception as e:
+        print("screen understanding failed: {}".format(e))
+        traceback.print_exc()
+        answer = "I couldn't read the screen just now."
+        voice.say(answer)
+
+    marks["answer"] = time.perf_counter() - t_start
+    print('Jarvis says: "{}"'.format(answer))
+    ui.set_reply(answer)
+    remember(text, answer)
+    voice.wait()
+    _finish(marks, t_start)
+
+
+def _agent_hooks(voice):
+    """How the computer agent talks mid-task: blocking speech (it waits for
+    your F8 right after asking) and a progress line on the panel."""
+    def say(line):
+        ui.set_reply(line)
+        voice.say(line, background=False)
+
+    def progress(line):
+        print(line)
+        ui.set_reply(line)
+
+    agent.set_hooks(say=say, progress=progress)
 
 
 def _chat_turn(text, t_start, marks, voice):

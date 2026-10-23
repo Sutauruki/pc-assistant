@@ -41,7 +41,7 @@ win10toast
 requests>=2.31
 
 # --- Tier 6: content & productivity (commands/docs, slides, sheets, pdf,
-# --- file_analysis, youtube_video, web_search, browser_automation,
+# --- file_analysis, youtube_video, web_search,
 # --- website_builder).
 # --- audioop-lts: pydub needs the audioop module that Python 3.13+ removed.
 python-docx>=1.1
@@ -55,4 +55,3 @@ audioop-lts>=0.2; python_version >= "3.13"
 youtube-transcript-api>=1.0
 ddgs>=9.0
 beautifulsoup4>=4.12
-playwright>=1.40
