@@ -220,6 +220,14 @@ def _prompt(task, step, history, notes, obs):
         'Window in front: {} -- "{}"'.format(window.get("process", "?"),
                                             window.get("title", "")),
     ]
+    try:
+        from commands import recall
+        known = recall.relevant(task)
+    except Exception:
+        known = []
+    if known:
+        parts.append("Things the user told you before (use them, e.g. contact "
+                     "names):\n" + "\n".join("- " + k for k in known))
     if obs["note"]:
         parts.append("NOTE: " + obs["note"])
     parts.append("Elements (number, type, name):\n" + _element_lines(obs["elements"]))

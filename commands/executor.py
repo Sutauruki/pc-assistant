@@ -45,6 +45,7 @@ from commands import locate
 from commands import memory
 from commands import notify as notifications
 from commands import pdf_export
+from commands import recall
 from commands import research
 from commands import screen_actions
 from commands import sheets
@@ -291,10 +292,15 @@ def _run_one(action):
             memory.forget_preference,
             _first(action, "text", "preference", "value", default=""),
         )
-    if kind in ("remember_this", "remember", "note_this"):
+    if kind in ("remember_this", "remember", "note_this", "remember_fact"):
+        # Lasting facts go to commands/recall.py, saved across restarts.
         return _call(
-            memory.remember_session,
+            recall.remember,
             _first(action, "text", "fact", "value", "content"),
+        )
+    if kind in ("forget_fact", "forget_this"):
+        return _call(
+            recall.forget, _first(action, "text", "fact", "value", default="")
         )
     if kind in ("list_memory", "what_do_you_remember", "show_memory"):
         return _call(memory.describe)

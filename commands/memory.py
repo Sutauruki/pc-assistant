@@ -398,8 +398,15 @@ def prompt_block(include_session=True):
     """
     prefs = preferences()
     facts = session_facts() if include_session else []
+    # Long-term facts relevant to this turn (commands/recall.py).
+    try:
+        from commands import recall
+        lasting = recall.prompt_block()
+    except Exception as e:
+        print("memory: couldn't read long-term facts ({})".format(e))
+        lasting = ""
 
-    if not prefs and not facts:
+    if not prefs and not facts and not lasting:
         return ""
 
     lines = []
@@ -419,6 +426,11 @@ def prompt_block(include_session=True):
         for text in facts:
             lines.append("- {}".format(text))
 
+    if lasting:
+        if lines:
+            lines.append("")
+        lines.append(lasting)
+
     return "\n".join(lines)
 
 
@@ -434,8 +446,13 @@ def describe():
     """
     prefs = preferences()
     facts = session_facts()
+    try:
+        from commands import recall
+        lasting = recall.describe()
+    except Exception:
+        lasting = ""
 
-    if not prefs and not facts:
+    if not prefs and not facts and not lasting:
         return ("I'm not remembering anything yet. Tell me how you'd like me to"
                 " do things and I'll keep it.")
 
@@ -458,6 +475,8 @@ def describe():
         if extra > 0:
             head += ", and {} more".format(extra)
         parts.append("For this session: {}".format(head))
+    if lasting:
+        parts.append(lasting)
 
     return ". ".join(parts)
 

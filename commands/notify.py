@@ -278,7 +278,21 @@ def notify(title, message=None, duration=DEFAULT_DURATION, blocking=False):
 # path registers a background activation handler that runs on_answered(text)
 # on a background thread when the toast is answered.
 
-_INTERACTIVE_APP_ID = "Jarvis.Confirmation"
+# Same app id as every other Jarvis toast. A made-up id ("Jarvis.Confirmation")
+# that was never registered is one Windows can silently refuse to show.
+_INTERACTIVE_APP_ID = APP_NAME
+
+
+def _can_encode(text):
+    """True if `text` can go into toast XML: valid Unicode with no control
+    characters besides newline and tab. Anything else falls back to the plain
+    toast. (This was called but never defined -- the NameError took the whole
+    turn down and, with it, the pending confirmation.)"""
+    try:
+        str(text).encode("utf-16", "strict")
+    except UnicodeError:
+        return False
+    return all(ch in "\n\t" or ord(ch) >= 32 for ch in str(text))
 
 
 def confirm(title, question, on_answered):

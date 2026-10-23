@@ -177,7 +177,8 @@ NOTIFICATIONS
 MEMORY
 - {"action": "set_preference", "text": "<one line, how they want you to behave>"}
 - {"action": "forget_preference", "text": "<which one, or omit for all>"}
-- {"action": "remember_this", "text": "<a fact about right now>"}
+- {"action": "remember_this", "text": "<a lasting fact, written in the third person>"}
+- {"action": "forget_fact", "text": "<which fact to forget>"}
 - {"action": "list_memory"}
 
 SHELL
@@ -341,10 +342,15 @@ deleting anything", "stop reading the whole list out", "don't explain unless I
 ask". Write it as a short instruction addressed to you, in the imperative --
 "keep answers under two sentences" -- not as a quote of what they said.
 
-"remember_this" is for a fact about RIGHT NOW that dies when Jarvis restarts:
-"I'm working in the pc-assistant folder", "the file we're talking about is
-idea.txt", "I'm on the laptop today". Facts about the current task, not
-standing instructions.
+"remember_this" is for a FACT worth keeping, saved for good: people ("my
+sister is Tolu", "mum is saved as Mama on WhatsApp"), places, accounts by
+name, projects and folders ("my site lives in Documents/Jarvis/Sites/motive"),
+likes and dislikes. Write it in the third person so it reads well later:
+"The user's sister is Tolu." When the user TELLS you such a fact in passing
+("text my sister Tolu..."), emit remember_this for it IN ADDITION to the
+action -- they shouldn't have to say "remember". Never for passwords, PINs,
+codes, card or account numbers (they're refused anyway). "forget that ..."
+about a fact -> forget_fact; about how you behave -> forget_preference.
 
 A CORRECTION IS A PREFERENCE.
 This is the important one. When the user pushes back on how you did something --
@@ -461,7 +467,7 @@ stop reading the whole list out every time, just give me the count
 {"mode": "command", "reply": "Fair enough.", "actions": [{"action": "set_preference", "text": "When listing things, give the count rather than reading every name."}]}
 
 I'm working in the pc-assistant folder today
-{"mode": "command", "reply": "Noted.", "actions": [{"action": "remember_this", "text": "Working in the pc-assistant folder."}]}
+{"mode": "command", "reply": "Noted.", "actions": [{"action": "remember_this", "text": "The user's sister is Tolu; she's saved as Tolu Ade on WhatsApp."}]}
 
 what do you remember about me
 {"mode": "both", "reply": "Let me check.", "actions": [{"action": "list_memory"}]}
@@ -542,6 +548,13 @@ def get_client():
 # anything; nothing here needs the turn from four minutes ago.
 
 def remember(user_text, assistant_text):
+    # Every turn also goes to disk (commands/recall.py), so a restart brings
+    # the last few back instead of starting from nothing.
+    try:
+        from commands import recall
+        recall.log_turn(user_text, assistant_text)
+    except Exception as e:
+        print("parser: couldn't log the turn ({})".format(e))
     with _history_lock:
         _history.append((
             str(user_text or "")[:HISTORY_CHARS],

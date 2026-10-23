@@ -14,4 +14,4 @@ cache
 !README.md
 *.onnx
 *.onnx.json
-test
+testdata
