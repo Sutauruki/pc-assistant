@@ -43,6 +43,7 @@ interleave.
 """
 
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -151,6 +152,12 @@ SPOKEN_RESULTS = {
 # Actions whose result is already a finished spoken answer. In mode "both"
 # these skip the second pass through the chat model that would only
 # paraphrase them -- a whole extra model round trip for nothing.
+# Results meant to be READ -- the window opens for a while to show them
+# (window_ui.peek), then shrinks back to the orb on its own.
+SHOWN_RESULTS = {"list_files", "find_file", "list_windows", "read_clipboard",
+                 "run_command", "list_memory", "where_is", "explain_command"}
+_SHOW_ME = re.compile(r"\b(show me|show it|display|on (the |your )?(screen|window))\b", re.I)
+
 DIRECT_ANSWERS = {"computer_task", "browser_run", "research_explain",
                   "research_save", "understand_screen", "system_info"}
 
@@ -891,7 +898,19 @@ def _run_turn(text, t_start, marks):
         voice.say(correction, background=False)
         notify.notify("Heads up", correction)
 
+    _maybe_peek(text, ordered)
     _finish(marks, t_start)
+
+
+def _maybe_peek(text, actions):
+    """Opens the window for a while when the turn produced something to read,
+    or you asked to be shown something."""
+    kinds = {a.get("action") for a in actions if isinstance(a, dict)}
+    if (kinds & SHOWN_RESULTS or _SHOW_ME.search(text or "")) and "jarvis_window" not in kinds:
+        try:
+            window_ui.peek()
+        except Exception:
+            pass
 
 
 def _screen_turn(text, actions, t_start, marks, voice):

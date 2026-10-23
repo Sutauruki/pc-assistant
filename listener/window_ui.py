@@ -2,9 +2,23 @@
 
 Goes in: listener/window_ui.py
 
-    expanded   wordmark header, a glowing orb, what you said, the reply, an
-               input field -- and Approve / Cancel when Jarvis asks
-    compact    just the orb, floating; double-click it (or "-") to switch
+    compact    the resting state: just the orb, floating on a transparent,
+               click-through background -- it still changes colour, breathes,
+               swells with the voice and shows the thinking comet
+    expanded   wordmark header, the orb, what you said, the reply, an input
+               field -- and Approve / Cancel when Jarvis asks
+
+WHEN IT OPENS
+-------------
+Compact unless there's a reason not to be:
+  - Jarvis needs your approval   -> opens, and shrinks back ~1.5s after
+                                    you decide
+  - a result is meant to be read -> peek(): opens for a while (file lists,
+    (or you said "show me...")      clipboard, command output), then
+                                    shrinks unless you're using it
+  - you ask                      -> show(): "maximize" / "show yourself"
+                                    keeps it open until "minimize" (hide())
+Double-click the orb, or "-" on the card, does the same by hand.
 
 DESIGN
 ------
@@ -51,7 +65,9 @@ from listener import console_input
 from listener import ui
 
 W, H = 340, 330            # expanded card
-MINI = 84                  # compact orb tile
+MINI = 70                  # compact orb window (transparent around the orb)
+PEEK_SECONDS = 25          # how long a peek stays open
+KEY = "#010203"            # colour made transparent in compact mode (Windows)
 ACTIVE_FPS = 30
 IDLE_FPS = 10              # enough for a smooth breath, cheap enough to ignore
 REPLY_CHARS = 170
@@ -82,6 +98,30 @@ _ready = threading.Event()
 _busy = threading.Event()
 _started = False
 _instance = None
+_requests = []             # ("show"|"hide"|"peek", arg), taken by the Tk thread
+_requests_lock = threading.Lock()
+
+
+def _request(kind, arg=None):
+    with _requests_lock:
+        _requests.append((kind, arg))
+
+
+def show():
+    """Open the card and keep it open until hide() -- "maximize", "show
+    yourself". Safe from any thread."""
+    _request("show")
+
+
+def hide():
+    """Back to the floating orb -- "minimize", "hide". Safe from any thread."""
+    _request("hide")
+
+
+def peek(seconds=PEEK_SECONDS):
+    """Open for a while to show something worth reading, then shrink back on
+    its own (unless you're hovering or typing). Safe from any thread."""
+    _request("peek", seconds)
 
 
 def enabled():
@@ -146,16 +186,17 @@ class _Orbs(object):
     def __init__(self):
         self._cache = {}
 
-    def get(self, colour, radius, level):
+    def get(self, colour, radius, level, glow=True, bg=CARD):
         step = max(0, min(LEVEL_STEPS, int(round(level * LEVEL_STEPS))))
-        key = (colour, radius, step)
+        key = (colour, radius, step, glow, bg)
         image = self._cache.get(key)
         if image is None:
-            image = self._cache[key] = self._render(colour, radius, step / float(LEVEL_STEPS))
+            image = self._cache[key] = self._render(
+                colour, radius, step / float(LEVEL_STEPS), glow, bg)
         return image
 
     @staticmethod
-    def _render(colour, base, level):
+    def _render(colour, base, level, glow=True, bg=CARD):
         import numpy as np
         from PIL import Image, ImageTk
 
@@ -166,15 +207,18 @@ class _Orbs(object):
         y, x = np.mgrid[0:size, 0:size].astype(np.float32)
         d = np.hypot(x - c, y - c)
 
-        card = np.array(_rgb(CARD), np.float32)
+        card = np.array(_rgb(bg), np.float32)
         tint = np.array(_rgb(colour), np.float32)
         out = np.broadcast_to(card, (size, size, 3)).copy()
 
-        # Glow: soft falloff outside the sphere.
-        t = np.clip(1.0 - (d - r) / max(g - r, 1.0), 0.0, 1.0)
-        glow_a = (t ** 2.2) * (0.30 + 0.25 * level)
-        glow_a[d < r] = 0.0
-        out += (tint - out) * glow_a[..., None]
+        # Glow: soft falloff outside the sphere. Not on the transparent
+        # compact window: a half-transparent glow can't be shown there (only
+        # the exact key colour turns transparent), so it would be a dark halo.
+        if glow:
+            t = np.clip(1.0 - (d - r) / max(g - r, 1.0), 0.0, 1.0)
+            glow_a = (t ** 2.2) * (0.30 + 0.25 * level)
+            glow_a[d < r] = 0.0
+            out += (tint - out) * glow_a[..., None]
 
         # Sphere: lit from the upper left, deeper toward the rim.
         hx, hy = c - 0.32 * r, c - 0.38 * r
@@ -223,7 +267,13 @@ class _Window(object):
         self.f_entry = (face, 10)
 
         self.orbs = _Orbs()
-        self.compact = False
+        self.compact = True        # resting state: the floating orb
+        self.pinned = False        # you asked for the card ("maximize")
+        self.auto = None           # why it opened by itself: "confirm" / "peek"
+        self.auto_until = 0.0
+        self.hover = False
+        self._asking = False
+        self.orb_pos = None        # orb centre on screen -- the anchor for both sizes
         self.level = 0.0
         self.t0 = time.time()
         self.hidden_for_agent = False
@@ -240,6 +290,8 @@ class _Window(object):
         self._round_corners()
 
         root.bind("<Button-3>", self._menu)
+        root.bind("<Enter>", lambda e: setattr(self, "hover", True))
+        root.bind("<Leave>", lambda e: setattr(self, "hover", False))
         self._fade_in(0.0)
 
     # -- construction --------------------------------------------------------
@@ -253,19 +305,20 @@ class _Window(object):
         self._last_text = None
 
         if self.compact:
-            self.root.geometry("{}x{}".format(MINI, MINI))
+            # Only the orb: everything in the key colour is see-through and
+            # click-through on Windows, so the window itself disappears.
+            self._transparent(True)
             cv.config(width=MINI, height=MINI)
-            self._round_rect(1, 1, MINI - 2, MINI - 2, 10, outline=EDGE, fill="")
             self.orb_xy = (MINI // 2, MINI // 2)
             self.orb_radius = 18
             self.orb = cv.create_image(*self.orb_xy)
             self.dots = [cv.create_oval(0, 0, 0, 0, outline="", fill="") for _ in range(3)]
             cv.bind("<ButtonPress-1>", self._drag_start)
             cv.bind("<B1-Motion>", self._drag_move)
-            cv.bind("<Double-Button-1>", lambda e: self.toggle_compact())
+            cv.bind("<Double-Button-1>", lambda e: self.expand(pin=True))
             return
 
-        self.root.geometry("{}x{}".format(W, H))
+        self._transparent(False)
         cv.config(width=W, height=H)
         cv.bind("<ButtonPress-1>", self._maybe_drag_start)
         cv.bind("<B1-Motion>", self._drag_move)
@@ -280,13 +333,13 @@ class _Window(object):
                                       font=(self.f_mark[0], 13))
         cv.tag_bind(self.btn_min, "<Enter>", lambda e: cv.itemconfig(self.btn_min, fill=TEXT))
         cv.tag_bind(self.btn_min, "<Leave>", lambda e: cv.itemconfig(self.btn_min, fill=FAINT))
-        cv.tag_bind(self.btn_min, "<Button-1>", lambda e: self.toggle_compact())
+        cv.tag_bind(self.btn_min, "<Button-1>", lambda e: self.collapse())
 
         # Orb and state.
         self.orb_xy = (W // 2, ORB_Y)
         self.orb_radius = 30
         self.orb = cv.create_image(*self.orb_xy)
-        cv.tag_bind(self.orb, "<Double-Button-1>", lambda e: self.toggle_compact())
+        cv.tag_bind(self.orb, "<Double-Button-1>", lambda e: self.collapse())
         self.dots = [cv.create_oval(0, 0, 0, 0, outline="", fill="") for _ in range(3)]
         self.state_text = cv.create_text(W // 2, 160, text="", fill=FAINT, font=self.f_label)
 
@@ -369,25 +422,45 @@ class _Window(object):
         if alpha < 0.97:
             self.root.after(16, self._fade_in, min(0.97, alpha + 0.12))
 
-    def _place(self):
+    def _transparent(self, on):
+        """Compact: the key colour becomes see-through (Windows; elsewhere the
+        orb sits on a small dark square). Expanded: back to the solid card."""
+        bg = KEY if on else CARD
+        self.root.configure(bg=bg)
+        self.canvas.config(bg=bg)
         try:
-            pos = json.loads(_position_file().read_text(encoding="utf-8"))
-            x, y = int(pos["x"]), int(pos["y"])
+            self.root.attributes("-transparentcolor", KEY if on else "")
         except Exception:
-            x = self.root.winfo_screenwidth() - W - 24
-            y = self.root.winfo_screenheight() - H - 72
-        x = min(max(0, x), max(0, self.root.winfo_screenwidth() - 60))
-        y = min(max(0, y), max(0, self.root.winfo_screenheight() - 60))
-        self.root.geometry("+{}+{}".format(x, y))
+            pass
+
+    def _place(self):
+        """Puts the window around the remembered orb position."""
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        if self.orb_pos is None:
+            try:
+                pos = json.loads(_position_file().read_text(encoding="utf-8"))
+                if "orb_x" in pos:
+                    self.orb_pos = (int(pos["orb_x"]), int(pos["orb_y"]))
+                else:  # saved by the previous version: the card's corner
+                    self.orb_pos = (int(pos["x"]) + W // 2, int(pos["y"]) + ORB_Y)
+            except Exception:
+                self.orb_pos = (sw - 60, sh - 120)
+        ox, oy = self.orb_pos
+        if self.compact:
+            w, h, x, y = MINI, MINI, ox - MINI // 2, oy - MINI // 2
+        else:
+            w, h, x, y = W, H, ox - W // 2, oy - ORB_Y
+        # Keep the whole card on screen even when the orb lives in a corner.
+        x = min(max(0, x), max(0, sw - w))
+        y = min(max(0, y), max(0, sh - h))
+        self.root.geometry("{}x{}+{}+{}".format(w, h, x, y))
 
     def _remember_position(self):
         self._save_pending = None
-        if self.compact:
-            return  # remember where the full card lives
         try:
             path = _position_file()
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"x": self.root.winfo_x(), "y": self.root.winfo_y()}),
+            path.write_text(json.dumps({"orb_x": self.orb_pos[0], "orb_y": self.orb_pos[1]}),
                             encoding="utf-8")
         except Exception:
             pass
@@ -404,26 +477,81 @@ class _Window(object):
     def _drag_move(self, event):
         if not self._drag:
             return
-        self.root.geometry("+{}+{}".format(event.x_root - self._drag[0],
-                                           event.y_root - self._drag[1]))
+        x, y = event.x_root - self._drag[0], event.y_root - self._drag[1]
+        self.root.geometry("+{}+{}".format(x, y))
+        self.orb_pos = ((x + MINI // 2, y + MINI // 2) if self.compact
+                        else (x + W // 2, y + ORB_Y))
         if self._save_pending:
             self.root.after_cancel(self._save_pending)
         self._save_pending = self.root.after(800, self._remember_position)
 
-    def toggle_compact(self):
-        # Keep the orb in the same place on screen when switching sizes.
-        x, y = self.root.winfo_x(), self.root.winfo_y()
-        dx, dy = W // 2 - MINI // 2, ORB_Y - MINI // 2
-        nx, ny = (x - dx, y - dy) if self.compact else (x + dx, y + dy)
-        self.compact = not self.compact
-        self._build()
-        self.root.geometry("+{}+{}".format(max(0, nx), max(0, ny)))
+    def expand(self, pin=False, auto=None):
+        """Open the card around the orb. pin: stays until collapse(); auto:
+        why it opened by itself ("confirm" or "peek")."""
+        if pin:
+            self.pinned, self.auto = True, None
+        elif auto and not self.pinned:
+            self.auto = auto
+        if self.compact:
+            self.compact = False
+            self._build()
+            self._place()
+
+    def collapse(self):
+        """Back to the floating orb, wherever the card was opened from."""
+        self.pinned, self.auto = False, None
+        if not self.compact:
+            if self.entry is not None:
+                self.root.focus_set()
+            self.compact = True
+            self._build()
+            self._place()
+
+    def _in_use(self):
+        """Hovering over the card, or typing in it -- don't shrink on them."""
+        if self.hover:
+            return True
+        try:
+            return (self.entry is not None and not self._placeholder
+                    and bool(self.entry.get().strip()))
+        except Exception:
+            return False
+
+    def _decide_size(self):
+        """Requests from Jarvis, then the automatic open/close rules."""
+        with _requests_lock:
+            pending = list(_requests)
+            del _requests[:]
+        now = time.time()
+        for kind, arg in pending:
+            if kind == "show":
+                self.expand(pin=True)
+            elif kind == "hide":
+                self.collapse()
+            elif kind == "peek":
+                if self.compact or self.auto == "peek":
+                    self.expand(auto="peek")
+                    self.auto_until = max(self.auto_until, now + float(arg or PEEK_SECONDS))
+
+        from commands import confirm
+        asking = confirm.is_pending()
+        if asking and not self._asking:
+            self.expand(auto="confirm")
+        elif not asking and self._asking and self.auto == "confirm":
+            # Decided: shrink back shortly, once the result has been seen.
+            self.auto, self.auto_until = "peek", now + 1.5
+        self._asking = asking
+
+        if self.auto == "peek" and now > self.auto_until and not self._in_use():
+            self.collapse()
+        return asking
 
     def _menu(self, event):
         menu = self.tkm.Menu(self.root, tearoff=0, bg=FIELD, fg=TEXT, bd=0,
                              activebackground=EDGE, activeforeground=TEXT, relief="flat")
-        menu.add_command(label="Expand" if self.compact else "Compact",
-                         command=self.toggle_compact)
+        menu.add_command(label="Expand" if self.compact else "Minimize",
+                         command=(lambda: self.expand(pin=True)) if self.compact
+                         else self.collapse)
         menu.add_command(label="Keep on top (toggle)", command=lambda: self.root.attributes(
             "-topmost", not self.root.attributes("-topmost")))
         menu.add_separator()
@@ -467,6 +595,7 @@ class _Window(object):
             self.hidden_for_agent = False
             self.root.deiconify()
 
+        asking = self._decide_size()
         snap = ui.snapshot()
         state = snap["state"]
         colour, label = _STATES.get(state, _STATES[ui.IDLE])
@@ -477,7 +606,11 @@ class _Window(object):
         shown = self.level if active else 0.06 + 0.06 * math.sin(now * 2 * math.pi / 3.6)
 
         cv = self.canvas
-        cv.itemconfig(self.orb, image=self.orbs.get(colour, self.orb_radius, shown))
+        if self.compact:
+            image = self.orbs.get(colour, self.orb_radius, shown, glow=False, bg=KEY)
+        else:
+            image = self.orbs.get(colour, self.orb_radius, shown)
+        cv.itemconfig(self.orb, image=image)
 
         if state == ui.THINKING:
             cx, cy = self.orb_xy
@@ -493,8 +626,6 @@ class _Window(object):
                 cv.itemconfig(dot, fill="")
 
         if not self.compact:
-            from commands import confirm
-            asking = confirm.is_pending()
             key = (state, snap["heard"], snap["reply"], asking)
             if key != self._last_text:
                 self._last_text = key

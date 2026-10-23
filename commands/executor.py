@@ -142,6 +142,32 @@ def _call(fn, *args):
     return msg
 
 
+_SELF_NAMES = {"", "jarvis", "yourself", "you", "your window", "this window",
+               "your self", "assistant", "the assistant", "jarvis window", "self"}
+
+
+def _is_self(target):
+    """A window command with no app named, or naming Jarvis, is about Jarvis.
+    (restore_window keeps its own meaning for an empty target: "put back
+    what you minimised" -- only an explicit self-name counts there.)"""
+    name = " ".join(str(target or "").lower().replace("'s", "").split())
+    return name in _SELF_NAMES
+
+
+def _jarvis_window(open_it):
+    try:
+        from listener import window_ui
+    except Exception:
+        return "My window isn't available."
+    if not window_ui.started():
+        return "My window isn't open -- it's turned off or couldn't start."
+    if open_it:
+        window_ui.show()
+        return "Here I am."
+    window_ui.hide()
+    return "Minimized."
+
+
 def _first(action, *keys, default=""):
     """First non-empty value among `keys`.
 
@@ -172,6 +198,20 @@ def _run_one(action):
         return take_screenshot()
     if kind == "refresh_apps":
         return refresh_apps()
+
+    # --- Jarvis's own window ---------------------------------------------------
+    # "maximize" / "minimize" with no app named, or naming Jarvis itself, is
+    # about this window -- the parser emits jarvis_window, and a bare
+    # maximize_window/minimize_window is caught here as a safety net.
+    if kind == "jarvis_window" or (
+            kind in ("maximize_window", "minimize_window")
+            and _is_self(action.get("target"))) or (
+            kind == "restore_window" and str(action.get("target") or "").strip()
+            and _is_self(action.get("target"))):
+        mode = str(action.get("mode") or "").lower()
+        if kind == "minimize_window" or mode in ("hide", "minimize", "minimise", "small", "close"):
+            return _jarvis_window(False)
+        return _jarvis_window(True)
 
     # --- windows ------------------------------------------------------------
     if kind == "focus_window":

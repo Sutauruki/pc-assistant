@@ -39,16 +39,17 @@ history, notifications and an action-confirmation protocol.
   Off by default.
 - **Typed input** — full command parser available from the keyboard; typed turns
   skip the 0.4 s wake-word cooldown entirely.
-- **Desktop window** (`listener/window_ui.py`) — a minimal floating card:
-  a glowing gradient orb (teal listening, rose hearing you, amber thinking
-  with an orbiting comet, blue speaking and swelling with the voice), what you
-  said, the reply, and an "Ask Jarvis..." field. When Jarvis needs a yes, the
-  field turns into **Approve / Cancel**. Borderless with native rounded
-  corners on Windows 11; drag it by the header. "–" or double-clicking the orb
-  shrinks it to a floating orb; double-click to expand. Right-click for Keep
-  on top / Quit. Tkinter + Pillow (both already here); the orb is rendered
-  once per size and cached, and it redraws at 10 fps idle. Hidden while the
-  computer agent works. `JARVIS_NO_WINDOW=1` turns it off.
+- **Desktop window** (`listener/window_ui.py`) — rests as a **floating orb**
+  on a transparent, click-through background (Windows): just the ball,
+  changing colour (teal listening, rose hearing you, amber thinking with an
+  orbiting comet, blue speaking and swelling with the voice). It opens into a
+  small card only when there's a reason: **an approval** (Approve / Cancel,
+  then it shrinks back ~1.5s after you decide), **something to read** (file
+  lists, clipboard, command output, or "show me...") for ~25s, or **when you
+  ask** — "maximize" / "show yourself" keeps it open until "minimize". A bare
+  "maximize" or "minimize" means Jarvis's own window. Double-click the orb to
+  open it, "–" to shrink; drag to move; right-click for Keep on top / Quit.
+  Hidden while the computer agent works. `JARVIS_NO_WINDOW=1` turns it off.
 - **Console UI** (`listener/ui.py`) — live ring, STT/TTS status, latency and
   turn counter, rerouted logs, and an overlay log viewer (`Ctrl+L`, arrows to
   scroll, `Esc` to close). Auto-disables when stdout isn't a terminal or
