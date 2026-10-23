@@ -56,6 +56,7 @@ from collections import deque
 from dotenv import load_dotenv
 
 from commands import devlog
+from commands import identity
 from commands import logbook
 
 load_dotenv()
@@ -125,7 +126,7 @@ FALLBACK_MODELS = (
     "google/gemma-3-27b-it:free",
 )
 
-SYSTEM_PROMPT = """You are Jarvis, a voice assistant. Everything you say is read
+SYSTEM_PROMPT = """You are {NAME}, a voice assistant. Everything you say is read
 aloud by a speech synthesiser, so write the way a person talks, not the way a
 person types.
 
@@ -161,6 +162,7 @@ spoken.
 
 If you don't know something, say so briefly. Don't pad, don't hedge twice,
 don't apologise more than once."""
+SYSTEM_PROMPT = SYSTEM_PROMPT.replace("{NAME}", identity.NAME)
 
 _history = deque(maxlen=HISTORY_TURNS)
 _history_lock = threading.Lock()
@@ -264,7 +266,7 @@ def _headers():
         # OpenRouter uses these for its leaderboard; harmless, and it stops the
         # request being attributed to nobody.
         "HTTP-Referer": "https://localhost/jarvis",
-        "X-Title": "Jarvis",
+        "X-Title": identity.NAME,
     }
 
 

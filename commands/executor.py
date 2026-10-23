@@ -35,6 +35,7 @@ import mss.tools
 from pycaw.pycaw import AudioUtilities
 
 from commands import agent
+from commands import identity
 from commands import app_index
 from commands import clipboard_actions
 from commands import cmd_control
@@ -147,11 +148,13 @@ _SELF_NAMES = {"", "jarvis", "yourself", "you", "your window", "this window",
 
 
 def _is_self(target):
-    """A window command with no app named, or naming Jarvis, is about Jarvis.
+    """A window command with no app named, or naming the assistant (any of
+    identity.ALIASES -- "novyx", "novix", the old "jarvis"), is about it.
     (restore_window keeps its own meaning for an empty target: "put back
     what you minimised" -- only an explicit self-name counts there.)"""
     name = " ".join(str(target or "").lower().replace("'s", "").split())
-    return name in _SELF_NAMES
+    return name in _SELF_NAMES or identity.is_me(name) or identity.is_me(
+        name.replace(" window", ""))
 
 
 def _jarvis_window(open_it):
@@ -309,7 +312,7 @@ def _run_one(action):
     if kind == "notify":
         return _call(
             notifications.notify,
-            _first(action, "title", "heading", default="Jarvis"),
+            _first(action, "title", "heading", default=identity.NAME),
             _first(action, "message", "body", "text"),
         )
 

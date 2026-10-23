@@ -232,6 +232,28 @@ anything stricter use a paid Gemini key, whose data isn't used that way.
 Windows accessibility on demand; if it doesn't on your machine, start Chrome
 with `--force-renderer-accessibility` (add it to the shortcut's Target).
 
+## Name and custom wake word
+
+The assistant is called **Novyx** (`ASSISTANT_NAME` in `.env`): that's how it
+introduces itself, the name in the window and notifications, and what "minimize
+Novyx" refers to. Your files stay in `Documents\Jarvis` and the `JARVIS_*`
+settings keep their names.
+
+**"Hey Novyx" wake word** — train it yourself, free (Google Colab, no
+recordings needed, under an hour):
+
+1. Open openWakeWord's training notebook:
+   https://colab.research.google.com/drive/1q1oe2zOyZp7UsB3jJiQ1IFn8z5YfjwEb
+2. Set the wake word to `hey novyx` (if the sample clips mispronounce it, try
+   a phonetic spelling such as `hey no vix`).
+3. Runtime → Run all, wait, then download the `.onnx` model it produces.
+4. Rename it `hey_novyx.onnx` and put it in `pc-assistant\models\`.
+5. Restart. The log says `Loading wake word model hey_novyx.onnx...`.
+
+Until the file exists, the built-in **"Hey Jarvis"** still wakes it, and the
+window tells you which phrase is live. Tune with `WAKE_THRESHOLD` (default
+0.40; higher = fewer false wakes, lower = wakes more easily).
+
 ## Memory
 
 | Kind | Example | Kept |

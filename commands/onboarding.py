@@ -31,7 +31,7 @@ ANSWER_SECONDS = 180
 # weather" -- so it pauses the interview and runs normally instead of being
 # saved as your occupation.
 _COMMANDY = re.compile(
-    r"^(hey jarvis\b|open |close |launch |play |search |google |delete |move |"
+    r"^(hey (jarvis|novyx|novix|nova x)\b|open |close |launch |play |search |google |delete |move |"
     r"copy |rename |minimi[sz]e|maximi[sz]e|turn |set the |take a |text |"
     r"message |send |call |remind |what'?s (on|the)|how (much|many|do i)|can you |"
     r"could you |please )", re.I)

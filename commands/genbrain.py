@@ -65,6 +65,7 @@ import time
 from dotenv import load_dotenv
 
 from commands import devlog
+from commands import identity
 
 load_dotenv()
 
@@ -375,7 +376,7 @@ def summarise(text, question="", limit=SUMMARY_INPUT_CHARS):
     ).format(excerpt=excerpt, question=question or "summarise it")
 
     system = (
-        "You are Jarvis, a voice assistant. Answer in the natural, spoken style "
+        "You are " + identity.NAME + ", a voice assistant. Answer in the natural, spoken style "
         "of a person talking -- two or three short sentences is the normal "
         "length, going longer only when the material genuinely needs it. No "
         "markdown, no bullet points, no symbols, no emoji: every word is read "
@@ -395,7 +396,7 @@ def probe():
     t0 = time.time()
     try:
         out = summarise(
-            "Jarvis is a voice assistant that lives on your PC and answers "
+            identity.NAME + " is a voice assistant that lives on your PC and answers "
             "out loud. It can open apps, manage files and generate documents.",
             "what is this?",
         )

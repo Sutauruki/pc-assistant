@@ -69,6 +69,7 @@ from listener import window_ui
 from listener.audio_out import get_stream as get_output_stream, close_stream
 from commands import agent
 from commands import chat
+from commands import identity
 from commands import cmd_control
 from commands import confirm
 from commands import devlog
@@ -581,7 +582,7 @@ def _answer_parked(asked, result, voice):
         return None
     if not answer:
         return None
-    print('Jarvis says: "{}"'.format(answer))
+    print('{} says: "{}"'.format(identity.NAME, answer))
     ui.set_reply(answer)
     remember(asked, answer)
     voice.wait()
@@ -622,7 +623,7 @@ def _answer_from_toast(text):
         print(result)
         ui.set_reply(result)
         _Voice({}, time.perf_counter()).say(result, background=False)
-        notify.notify("Jarvis", "Done: {}".format(result))
+        notify.notify(identity.NAME, "Done: {}".format(result))
 
 
 def _chat_context(text, actions, results):
@@ -749,7 +750,7 @@ def _run_turn(text, t_start, marks):
     if onboarding.active():
         line = onboarding.answer(text)
         if line:
-            print('Jarvis asks: "{}"'.format(line))
+            print('{} asks: "{}"'.format(identity.NAME, line))
             ui.set_reply(line)
             remember(text, line)
             if onboarding.active():
@@ -786,7 +787,7 @@ def _run_turn(text, t_start, marks):
             return
         marks["reply"] = time.perf_counter() - t_start
         route["spoke"] = True
-        print('Jarvis says: "{}"'.format(reply))
+        print('{} says: "{}"'.format(identity.NAME, reply))
         ui.set_reply(reply)
         voice.say(reply)
 
@@ -820,7 +821,7 @@ def _run_turn(text, t_start, marks):
     # flag is what keeps this from saying the line a second time.
     if reply and not route["spoke"]:
         route["spoke"] = True
-        print('Jarvis says: "{}"'.format(reply))
+        print('{} says: "{}"'.format(identity.NAME, reply))
         ui.set_reply(reply)
         voice.say(reply)
 
@@ -877,7 +878,7 @@ def _run_turn(text, t_start, marks):
         remember(text, " ".join(spoken) if spoken else reply)
         if spoken:
             line = " ".join(spoken)
-            print('Jarvis reports: "{}"'.format(line))
+            print('{} reports: "{}"'.format(identity.NAME, line))
             ui.set_reply(line)
             voice.say(line, background=False)
 
@@ -901,7 +902,7 @@ def _run_turn(text, t_start, marks):
     if confirm.is_pending():
         confirm.set_context(text, [a.get("action") for a in ordered if isinstance(a, dict)])
         question = confirm.question()
-        print('Jarvis asks: "{}"'.format(question))
+        print('{} asks: "{}"'.format(identity.NAME, question))
         ui.set_reply(question)
         voice.say(question, background=False)
         # An answerable toast: [Yes]/[No] buttons plus a text box, so the
@@ -912,7 +913,7 @@ def _run_turn(text, t_start, marks):
         # here used to raise out of the turn, and _guarded_turn's clean-up
         # then cleared the very confirmation it was showing.
         try:
-            notify.confirm("Jarvis", question, _answer_from_toast)
+            notify.confirm(identity.NAME, question, _answer_from_toast)
         except Exception as e:
             print("couldn't show the confirmation toast ({})".format(e))
         _finish(marks, t_start)
@@ -929,7 +930,7 @@ def _run_turn(text, t_start, marks):
     # chat brain answered from.
     if mode != "both" and _failed(unspoken):
         correction = generate_reply(unspoken)
-        print('Jarvis corrects: "{}"'.format(correction))
+        print('{} corrects: "{}"'.format(identity.NAME, correction))
         ui.set_reply(correction)
         voice.say(correction, background=False)
         notify.notify("Heads up", correction)
@@ -974,7 +975,7 @@ def _screen_turn(text, actions, t_start, marks, voice):
         voice.say(answer)
 
     marks["answer"] = time.perf_counter() - t_start
-    print('Jarvis says: "{}"'.format(answer))
+    print('{} says: "{}"'.format(identity.NAME, answer))
     ui.set_reply(answer)
     remember(text, answer)
     voice.wait()
@@ -1017,7 +1018,7 @@ def _chat_turn(text, t_start, marks, voice):
         voice.say(answer)
 
     marks["answer"] = time.perf_counter() - t_start
-    print('Jarvis says: "{}"'.format(answer))
+    print('{} says: "{}"'.format(identity.NAME, answer))
     ui.set_reply(answer)
 
     # chat.py keeps its own history, but the router keeps a separate one and
@@ -1062,7 +1063,7 @@ def _answer_from_results(text, actions, results, t_start, marks, voice):
         voice.say(answer)
 
     marks["answer"] = time.perf_counter() - t_start
-    print('Jarvis says: "{}"'.format(answer))
+    print('{} says: "{}"'.format(identity.NAME, answer))
     ui.set_reply(answer)
 
     voice.wait()
@@ -1130,9 +1131,9 @@ def _banner(typing=False):
     if ui.is_active():
         return
     if typing:
-        print("Listening for 'Hey Jarvis' -- or just type. (Ctrl+C to stop)")
+        print("Listening for '{}' -- or just type. (Ctrl+C to stop)".format(identity.wake_phrase()))
     else:
-        print("Listening for 'Hey Jarvis'... (Ctrl+C to stop)")
+        print("Listening for '{}'... (Ctrl+C to stop)".format(identity.wake_phrase()))
 
 
 def _settle(stream, model, typed):
@@ -1465,8 +1466,8 @@ def _clear_terminal():
 def main():
     _clear_terminal()
     if os.name == "nt":
-        os.system("title Jarvis")
-    print("Starting Jarvis...")
+        os.system("title {}".format(identity.NAME))
+    print("Starting {}...".format(identity.NAME))
 
     # A provider reply is spoken, and it is also printed. The Windows console
     # defaults to cp1252, and model text carries characters it cannot encode
@@ -1483,7 +1484,8 @@ def main():
     # chatter from native code, which goes to the real file descriptors and
     # sails straight past the stdout proxy -- so anything drawn before this
     # point gets written over and leaves a fragment of a panel on screen.
-    model = load_wake_word_model("hey_jarvis")
+    # models/hey_novyx.onnx when you've trained it, else the built-in Hey Jarvis.
+    model = load_wake_word_model()
     # Open the speaker up front so the first reply isn't slow -- at the
     # voice's own rate (FISH_SAMPLE_RATE), so it never has to reopen.
     get_output_stream(tts.output_rate())

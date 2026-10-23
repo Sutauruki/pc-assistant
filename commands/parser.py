@@ -75,7 +75,14 @@ _history_lock = threading.Lock()
 # Key order is mandatory and the prompt says so twice. "mode" first so the
 # route is known early; "reply" second so speech can start while "actions" is
 # still generating.
-SYSTEM_PROMPT = """You are Jarvis, a voice-controlled PC assistant with a friendly,
+
+def _named(prompt):
+    """Puts the assistant's name (commands/identity.py) into a prompt."""
+    from commands import identity
+    aliases = ", ".join('"{}"'.format(a) for a in identity.ALIASES)
+    return prompt.replace("{NAME}", identity.NAME).replace("{ALIASES}", aliases)
+
+SYSTEM_PROMPT = """You are {NAME}, a voice-controlled PC assistant with a friendly,
 natural speaking voice. Convert the user's spoken text into a JSON object with
 exactly three keys, emitted in THIS ORDER: "mode", then "reply", then "actions".
 
@@ -297,10 +304,10 @@ WINDOW COMMANDS
 the front. Use focus_window for "switch to", "bring up", "go to", "show me",
 "put X in front". Use open_app for "open", "launch", "start", "run".
 
-YOUR OWN WINDOW. You (Jarvis) have a small window: a floating orb that opens
+YOUR OWN WINDOW. You ({NAME}) have a small window: a floating orb that opens
 into a card. "maximize", "minimize", "expand", "shrink", "show yourself",
 "hide", "go small", "show me your window" -- with NO app named, or naming you
-("jarvis", "yourself", "your window") -- are about YOU: emit jarvis_window
+({ALIASES}, "yourself", "your window") -- are about YOU: emit jarvis_window
 with mode "show" or "hide", never maximize_window/minimize_window (those need
 an app). "minimize chrome" is still minimize_window. "show me that" / "put it
 on screen" after you just said something -> jarvis_window show. Mode
@@ -548,6 +555,7 @@ stop the preview server
 {"mode": "both", "reply": "Stopping it.", "actions": [{"action": "stop_preview"}]}
 
 Respond with ONLY the JSON object, nothing else."""
+SYSTEM_PROMPT = _named(SYSTEM_PROMPT)
 
 
 _ESCAPES = {
@@ -1003,12 +1011,13 @@ def parse_command(text, on_reply=None, on_mode=None):
     return mode, actions, reply
 
 
-REPLY_SYSTEM_PROMPT = """You are Jarvis, a helpful voice assistant speaking out loud.
+REPLY_SYSTEM_PROMPT = """You are {NAME}, a helpful voice assistant speaking out loud.
 You just performed some actions on the user's PC, and at least one of them failed.
 Given the raw result messages, respond with ONE short, natural, spoken sentence
 that honestly reflects what happened -- including the failure. Sound casual and
 human, not robotic. Keep it under 20 words when possible. No markdown, no
 symbols, no lists -- this is read aloud."""
+REPLY_SYSTEM_PROMPT = _named(REPLY_SYSTEM_PROMPT)
 
 
 def _reply_system_prompt():

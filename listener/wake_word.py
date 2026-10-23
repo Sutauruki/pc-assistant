@@ -16,6 +16,14 @@ no model call. That is both a false-trigger guard and the main CPU saving
 for a 24/7 listener -- most of the day the mic hears nothing, and near-
 silence needs no inference.
 
+WHICH WAKE WORD
+---------------
+A custom model wins when there is one: WAKE_WORD_MODEL (a path), or else
+models/hey_<name>.onnx for the assistant's name (commands/identity.py) --
+models/hey_novyx.onnx for Novyx. Train it free with openWakeWord's notebook
+(see the README, "Custom wake word"). Without one, the built-in "Hey Jarvis"
+model is used and the UI says so.
+
 Tuning via environment:
   WAKE_THRESHOLD  score needed to trigger (default 0.40)
   WAKE_SILENCE_RMS  int16 RMS below which a chunk is skipped (default 60)
@@ -23,6 +31,8 @@ Tuning via environment:
 """
 
 import os
+import re
+from pathlib import Path
 
 import numpy as np
 
@@ -74,9 +84,52 @@ def _autogain(chunk):
     return np.clip(scaled, -32768, 32767).astype(np.int16)
 
 
-def load_wake_word_model(wake_word="hey_jarvis"):
+_MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+
+
+def _custom_model():
+    """Path to a custom wake-word model, or None."""
+    from commands import identity
+    configured = os.getenv("WAKE_WORD_MODEL", "").strip().strip('"')
+    if configured:
+        path = Path(configured)
+        if not path.is_absolute():
+            path = _MODELS_DIR.parent / path
+        if path.exists():
+            return path
+        print("wake word: WAKE_WORD_MODEL {} not found, using the default".format(configured))
+        return None
+    slug = re.sub(r"[^a-z0-9]+", "_", identity.NAME.lower()).strip("_")
+    for candidate in (_MODELS_DIR / "hey_{}.onnx".format(slug),
+                      _MODELS_DIR / "{}.onnx".format(slug)):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _phrase_from(path):
+    """'hey_novyx.onnx' -> 'Hey Novyx'."""
+    words = re.split(r"[_\-\s]+", Path(path).stem)
+    return " ".join(w.capitalize() for w in words if w and not re.fullmatch(r"v?\d+", w))
+
+
+def load_wake_word_model(wake_word=None):
+    """The custom model for the assistant's name when there is one, else the
+    built-in "hey_jarvis". Tells commands/identity.py which phrase is live."""
+    from commands import identity
+    custom = None if wake_word else _custom_model()
+    if custom is not None:
+        print("Loading wake word model {}...".format(custom.name))
+        try:
+            framework = "onnx" if custom.suffix == ".onnx" else "tflite"
+            model = Model(wakeword_models=[str(custom)], inference_framework=framework)
+            identity.set_wake_phrase(_phrase_from(custom))
+            return model
+        except Exception as e:
+            print("wake word: couldn't load {} ({}), using Hey Jarvis".format(custom.name, e))
     print("Loading wake word model...")
-    return Model(wakeword_models=[wake_word])
+    identity.set_wake_phrase("Hey Jarvis")
+    return Model(wakeword_models=[wake_word or "hey_jarvis"])
 
 
 def check_wake_word(model, audio_chunk, threshold=None):

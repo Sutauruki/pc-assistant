@@ -45,7 +45,9 @@ import os
 import subprocess
 import threading
 
-APP_NAME = "Jarvis"
+from commands import identity
+
+APP_NAME = identity.NAME
 
 # Windows truncates well before this, but trimming ourselves means the cut
 # lands on a word rather than mid-syllable.
@@ -399,5 +401,5 @@ def available():
 if __name__ == "__main__":
     # python -m commands.notify
     print("importable backends:", ", ".join(available()) or "(none)")
-    print(notify("Jarvis", "Toast test -- if you can see this, it works.",
+    print(notify(APP_NAME, "Toast test -- if you can see this, it works.",
                  blocking=True))

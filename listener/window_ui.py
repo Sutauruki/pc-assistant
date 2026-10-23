@@ -61,6 +61,7 @@ import threading
 import time
 from pathlib import Path
 
+from commands import identity
 from listener import console_input
 from listener import ui
 
@@ -244,7 +245,7 @@ class _Window(object):
 
         self.tkm = tkm
         self.root = root
-        root.title("Jarvis")
+        root.title(identity.NAME)
         root.overrideredirect(True)
         root.configure(bg=CARD)
         root.attributes("-topmost", True)
@@ -328,7 +329,7 @@ class _Window(object):
         self._round_rect(1, 1, W - 2, H - 2, 10, outline=EDGE, fill="")
 
         # Header: wordmark, and "-" to shrink to the orb.
-        cv.create_text(22, 22, text=_spaced("Jarvis"), anchor="w", fill=SOFT, font=self.f_mark)
+        cv.create_text(22, 22, text=_spaced(identity.NAME), anchor="w", fill=SOFT, font=self.f_mark)
         self.btn_min = cv.create_text(W - 24, 20, text="–", fill=FAINT,
                                       font=(self.f_mark[0], 13))
         cv.tag_bind(self.btn_min, "<Enter>", lambda e: cv.itemconfig(self.btn_min, fill=TEXT))
@@ -356,7 +357,7 @@ class _Window(object):
         self.entry = self.tkm.Entry(self.root, bg=FIELD, fg=FAINT, insertbackground=TEXT,
                                     relief="flat", bd=0, highlightthickness=0,
                                     font=self.f_entry)
-        self.entry.insert(0, "Ask Jarvis…")
+        self.entry.insert(0, "Ask {}…".format(identity.NAME))
         self._placeholder = True
         entry_item = cv.create_window(34, fy + 19, window=self.entry, anchor="w",
                                       width=W - 106, height=24)
@@ -555,7 +556,7 @@ class _Window(object):
         menu.add_command(label="Keep on top (toggle)", command=lambda: self.root.attributes(
             "-topmost", not self.root.attributes("-topmost")))
         menu.add_separator()
-        menu.add_command(label="Quit Jarvis", command=self._quit)
+        menu.add_command(label="Quit {}".format(identity.NAME), command=self._quit)
         menu.tk_popup(event.x_root, event.y_root)
 
     def _quit(self):
@@ -571,7 +572,7 @@ class _Window(object):
 
     def _entry_blur(self, _event=None):
         if not self.entry.get():
-            self.entry.insert(0, "Ask Jarvis…")
+            self.entry.insert(0, "Ask {}…".format(identity.NAME))
             self.entry.config(fg=FAINT)
             self._placeholder = True
 
@@ -636,7 +637,7 @@ class _Window(object):
                                   fill=TEXT)
                 else:
                     cv.itemconfig(self.reply_text, fill=FAINT, text="" if snap["heard"] else
-                                  "Say “Hey Jarvis”, or type below.")
+                                  "Say “{}”, or type below.".format(identity.wake_phrase()))
                 # The reply moves up when there's no "you said" line above it.
                 cv.coords(self.reply_text, 24, 206 if snap["heard"] else 186)
                 self._show_confirm(asking)

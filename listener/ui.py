@@ -297,6 +297,12 @@ class _StreamProxy(object):
         return getattr(self._original, name)
 
 
+
+def _title():
+    """The panel's letter-spaced wordmark: the assistant's name."""
+    from commands import identity
+    return " ".join(identity.NAME.upper())
+
 class Dashboard(object):
     def __init__(self):
         self._lock = threading.RLock()
@@ -818,7 +824,7 @@ class Dashboard(object):
         # and the longest status ("* RECORDING"). Below that the fill would
         # clamp, the row would overrun the panel, and a wrapped row throws off
         # the cursor-up count -- so draw nothing instead.
-        if inner + 4 < 8 + len("J A R V I S") + len("* RECORDING") + 1:
+        if inner + 4 < 8 + len(_title()) + len("* RECORDING") + 1:
             return None
 
         label, accent = _STATE_STYLE.get(self._state, _STATE_STYLE[IDLE])
@@ -849,7 +855,7 @@ class Dashboard(object):
             spinner = self._spinner
             marker = spinner[self._spin // 4 % len(spinner)]
 
-        title = "J A R V I S"
+        title = _title()
         status = "{} {}".format(marker, label)
 
         # Every row must come out to exactly inner + 4 visible columns or the
@@ -936,7 +942,7 @@ class Dashboard(object):
         has the whole panel to itself. Opens with ctrl+L, closes the same
         way (or with Esc); ↑/↓/PageUp/PageDown scroll a window scrolled by
         history_scroll()."""
-        title = "J A R V I S"
+        title = _title()
         status = "  H I S T O R Y  "
         fill = max(1, (inner + 4) - 8 - len(title) - len(status))
         rows = [
