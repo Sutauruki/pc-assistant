@@ -35,6 +35,7 @@ import hashlib
 import os
 import queue
 import threading
+import time
 from pathlib import Path
 
 try:
@@ -293,25 +294,119 @@ def speak(text, on_first_audio=None):
     return out.player
 
 
-# Upper bound on one request's text when batching sentences that arrived
-# while the previous request was downloading (Fish's own chunk_length cap).
-_MAX_SEGMENT_CHARS = 300
+# --- Streaming a reply that is still being written --------------------------
+#
+# Each request is a separate clip, and two things used to make the joins
+# audible -- right after the "." or "?" where one clip ended:
+#   1. the next request only started once the previous one had finished
+#      downloading, and on the free tier that's barely faster than playback,
+#      so its start-up time became a gap;
+#   2. every clip carries Fish's own lead-in and trailing silence.
+# So: fewer, bigger requests; the next one is fetched while the current one
+# plays (_IN_FLIGHT at a time, well inside Fish's concurrency limit); and the
+# silence where two clips meet is trimmed to one natural pause.
+
+_MAX_SEGMENT_CHARS = 300   # Fish's own chunk_length cap
+_FIRST_MIN_CHARS = 80      # gather this much before the first request...
+_BATCH_MIN_CHARS = 160     # ...and this much for each later one
+_GATHER_WAIT = 0.6         # but never wait longer than this for more text
+_IN_FLIGHT = 2             # requests running at once
+_JOIN_PAUSE = 0.22         # quiet kept where two clips meet: one natural sentence break
+_SILENCE = 350             # |sample| below this (about -40 dBFS) is silence
+
+
+class _Segment(object):
+    def __init__(self, text, fetch=True):
+        self.text = text
+        self.fetch = fetch
+        self.chunks = queue.Queue()
+        self.error = None
+
+
+def _fetch(segment, slots):
+    try:
+        _synth(segment.text, segment.chunks.put)
+    except Exception as e:
+        segment.error = e
+    finally:
+        segment.chunks.put(_DONE)
+        slots.release()
+
+
+def _quiet_head(samples, keep):
+    """Index of the first sample worth keeping: leading silence trimmed to
+    `keep` samples."""
+    import numpy as np
+    loud = np.flatnonzero(np.abs(samples) > _SILENCE)
+    if not len(loud):
+        return None  # all silence so far
+    return max(0, int(loud[0]) - keep)
+
+
+def _quiet_tail(samples, keep):
+    """Length to keep: trailing silence trimmed to `keep` samples."""
+    import numpy as np
+    loud = np.flatnonzero(np.abs(samples) > _SILENCE)
+    if not len(loud):
+        return 0
+    return min(len(samples), int(loud[-1]) + 1 + keep)
+
+
+def _play_segment(segment, out):
+    """Feeds one clip to the player with its edge silence trimmed. Returns
+    True if any of its audio was played."""
+    import numpy as np
+    keep = int(SAMPLE_RATE * _JOIN_PAUSE / 2)
+    hold_samples = int(SAMPLE_RATE * 0.5)  # held back until we know it's the tail
+    carry = b""
+    held = np.zeros(0, dtype=np.int16)
+    started = False
+    played = False
+    while True:
+        item = segment.chunks.get()
+        if item is _DONE:
+            break
+        data = carry + item
+        cut = len(data) - (len(data) % 2)
+        carry = data[cut:]
+        held = np.concatenate([held, np.frombuffer(data[:cut], dtype=np.int16)])
+        if not started:
+            head = _quiet_head(held, keep)
+            if head is None:
+                held = held[-keep:] if len(held) > keep else held
+                continue
+            held = held[head:]
+            started = True
+        if len(held) > hold_samples:
+            out.feed(held[:-hold_samples].tobytes())
+            played = True
+            held = held[-hold_samples:]
+    if started and len(held):
+        held = held[:_quiet_tail(held, keep)]
+        if len(held):
+            out.feed(held.tobytes())
+            played = True
+    return played
 
 
 def speak_stream(pieces, on_first_audio=None):
     """Speaks text while it is still being generated.
 
-    The first sentence goes to Fish the moment it arrives, so the reply
-    starts after one sentence instead of after the whole answer. Each request
-    downloads faster than it plays, so the next one -- every sentence that
-    arrived in the meantime, batched -- is requested while the previous one is
-    still on the speakers, and all of it feeds one continuous player.
+    Sentences are gathered into a few bigger requests (_FIRST_MIN_CHARS for
+    the first, _BATCH_MIN_CHARS after, never waiting more than _GATHER_WAIT
+    for more text). Each request starts as soon as its text is ready -- up to
+    _IN_FLIGHT at once -- so the next clip is downloading while the current
+    one plays, and the clips are joined with their edge silence trimmed into
+    one continuous player.
 
     Returns (player, unspoken): player is None when nothing was spoken;
-    unspoken is the text Fish couldn't voice (the failed piece plus the rest
-    of the stream), for the caller to hand to Moonshine.
+    unspoken is the text Fish couldn't voice (from the first clip that
+    failed before any of it played, to the end), for Moonshine.
     """
     incoming = queue.Queue()
+    segments = queue.Queue()
+    abort = threading.Event()
+    slots = threading.Semaphore(_IN_FLIGHT)
 
     def pump():
         try:
@@ -321,58 +416,87 @@ def speak_stream(pieces, on_first_audio=None):
         finally:
             incoming.put(_DONE)
 
-    threading.Thread(target=pump, daemon=True).start()
-
-    def rest():
-        parts = []
-        while True:
-            item = incoming.get()
+    def gather(min_chars):
+        """(text, stream_finished). text is None when nothing is left."""
+        item = incoming.get()
+        if item is _DONE:
+            return None, True
+        parts, size = [item], len(item)
+        deadline = time.time() + _GATHER_WAIT
+        while size < min_chars:
+            wait = deadline - time.time()
+            if wait <= 0:
+                break
+            try:
+                item = incoming.get(timeout=wait)
+            except queue.Empty:
+                break
             if item is _DONE:
-                return parts
+                return " ".join(parts), True
             parts.append(item)
+            size += len(item) + 1
+        while size < _MAX_SEGMENT_CHARS:  # whatever else is already here
+            try:
+                item = incoming.get_nowait()
+            except queue.Empty:
+                break
+            if item is _DONE:
+                return " ".join(parts), True
+            parts.append(item)
+            size += len(item) + 1
+        return " ".join(parts), False
+
+    def segmenter():
+        try:
+            minimum, finished = _FIRST_MIN_CHARS, False
+            while not finished:
+                text, finished = gather(minimum)
+                if text is None:
+                    break
+                minimum = _BATCH_MIN_CHARS
+                if abort.is_set():
+                    segments.put(_Segment(text, fetch=False))  # text only, for Moonshine
+                    continue
+                slots.acquire()
+                segment = _Segment(text)
+                segments.put(segment)
+                threading.Thread(target=_fetch, args=(segment, slots), daemon=True).start()
+        finally:
+            segments.put(_DONE)
+
+    threading.Thread(target=pump, daemon=True).start()
+    threading.Thread(target=segmenter, daemon=True).start()
 
     out = _Output(on_first_audio)
     unspoken = []
     try:
-        segment = incoming.get()
-        finished = segment is _DONE
-        while not finished:
-            try:
-                _synth(segment, out.feed)
-            except Exception as e:
-                if str(e) != "not available":
-                    print("tts_fish: streaming failed ({})".format(e))
-                unspoken = [segment] + rest()
+        while True:
+            segment = segments.get()
+            if segment is _DONE:
                 break
-
-            # Next segment: wait for at least one sentence, then take
-            # whatever else is already waiting, up to one request's worth.
-            item = incoming.get()
-            if item is _DONE:
-                break
-            parts, size = [item], len(item)
-            while size < _MAX_SEGMENT_CHARS:
-                try:
-                    item = incoming.get_nowait()
-                except queue.Empty:
-                    break
-                if item is _DONE:
-                    finished = True
-                    break
-                parts.append(item)
-                size += len(item) + 1
-            segment = " ".join(parts)
-            if finished:
-                # The stream closed during batching; speak the last batch.
-                try:
-                    _synth(segment, out.feed)
-                except Exception as e:
-                    print("tts_fish: streaming failed ({})".format(e))
-                    unspoken = [segment]
+            if abort.is_set() or not segment.fetch:
+                unspoken.append(segment.text)
+                if segment.fetch:
+                    _drain(segment)
+                continue
+            played = _play_segment(segment, out)
+            if segment.error is not None:
+                if str(segment.error) != "not available":
+                    print("tts_fish: streaming failed ({})".format(segment.error))
+                if not played:
+                    # Nothing of this clip was heard: hand it, and everything
+                    # after it, to Moonshine.
+                    abort.set()
+                    unspoken.append(segment.text)
     finally:
         out.finish()
 
     return out.player, " ".join(unspoken)
+
+
+def _drain(segment):
+    while segment.chunks.get() is not _DONE:
+        pass
 
 
 if __name__ == "__main__":

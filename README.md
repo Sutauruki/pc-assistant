@@ -17,8 +17,9 @@ history, notifications and an action-confirmation protocol.
 - **TTS** — Fish Audio's S2.1 Pro cloud voice (free `s2.1-pro-free` tier,
   streamed as raw PCM), falling back to Moonshine's offline voices
   (Kokoro/Piper, via its C core) when there's no key, no network, or Fish
-  refuses. Chat replies start speaking after the first sentence while the
-  rest is still being written, and short repeated replies ("Done.") play
+  refuses. Chat replies start speaking while the rest is still being written:
+  sentences are grouped into a few requests, the next one downloads while the
+  current one plays, and the joins are trimmed to a natural pause, and short repeated replies ("Done.") play
   from an on-disk cache. Played straight through with no time-stretch, with overlap: the
   reply starts while actions are still running.
 - **Screen understanding** — captures only the monitor you're working on,
