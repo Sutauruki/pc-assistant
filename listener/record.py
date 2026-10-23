@@ -1,50 +1,120 @@
-"""Fast endpointing for the mic.
+"""Fast, forgiving endpointing for the mic.
 
-Goes in: listener/record.py  (replaces existing)
+Goes in: listener/record.py
 
-One addition this round: give_up_after. The loop only ends on silence that
-*follows* speech, which is right for a command -- you pressed the wake word, so
-something is coming. It is wrong for the follow-up question after "should I
-delete these?", where the honest possibility is that nobody answers. Without a
-give-up path that case holds the microphone for the full MAX_RECORD_SECONDS and
-the assistant is deaf for fifteen seconds, twice over.
+WHAT WAS WRONG
+--------------
+1. The "room noise" was measured from the first half-second of each
+   recording -- which, right after "hey Jarvis", is usually you already
+   talking. The speech gate was then set at 3x your own voice, so normal
+   speech didn't count as speech: you had to shout to start it, and shout
+   again before it would notice you'd stopped.
+2. One threshold did two jobs. Soft syllables and trailing words dipped
+   under it, and 0.7s later the recording ended mid-sentence.
+
+WHAT IT DOES NOW
+----------------
+- The room is learned while Jarvis waits for the wake word: main.py hands
+  every listening chunk to note_ambient(), which tracks a low percentile of
+  recent levels (the quiet moments, not your voice). Recordings start with
+  the gate already set, and keep learning from the quiet chunks inside them.
+- Two gates (hysteresis): START_RATIO x room to decide you've started,
+  the lower KEEP_RATIO x room to decide you're still talking -- so a soft
+  ending doesn't count as stopping.
+- SILENCE_SECONDS (1.2s) of quiet ends it, which rides over natural pauses.
+- normalize() lifts quiet recordings before speech-to-text, without
+  boosting near-silence into fake words.
+
+Tune in .env if needed:
+    MIC_SENSITIVITY=1.0        higher = hears quieter speech (1.5 for a
+                               soft voice or far mic; 0.7 for a loud room)
+    RECORD_SILENCE_SECONDS=1.2 how long a pause ends the recording
 """
 
+import collections
+import os
 import time
 
 import numpy as np
 
 from listener import ui
 
-# --- Endpointing -----------------------------------------------------------
-# The old config waited 4.5s of silence after you stopped speaking before it
-# even stopped recording. That one constant was the largest single chunk of
-# the delay before Jarvis said anything.
-#
-# 700ms rides over natural mid-sentence pauses without making you wait.
-SILENCE_HANGOVER = 0.7
-GRACE_PERIOD = 3          # ignore silence in the opening moments
-MIN_SPEECH_SECONDS = 0.25    # don't endpoint on a click or a door slam
+
+def _env_float(name, default):
+    try:
+        return float(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+
+
+SILENCE_SECONDS = max(0.4, _env_float("RECORD_SILENCE_SECONDS", 1.2))
+SENSITIVITY = min(4.0, max(0.25, _env_float("MIC_SENSITIVITY", 1.0)))
+GRACE_PERIOD = 3.0          # never end in the first moments, before you've begun
+MIN_SPEECH_SECONDS = 0.25   # a click or a door slam isn't speech
 MAX_RECORD_SECONDS = 60
 
-# --- Adaptive gating -------------------------------------------------------
-# A fixed RMS threshold breaks both ways: in a noisy room it never endpoints,
-# on a quiet mic it endpoints mid-word. Measure the room during the first few
-# chunks instead and set the speech gate relative to that.
-NOISE_FLOOR_CHUNKS = 6
-SPEECH_MULTIPLIER = 3.0
-MIN_SPEECH_RMS = 250.0
-MAX_SPEECH_RMS = 2000.0
+# Speech gates, relative to the room -- divided by MIC_SENSITIVITY.
+START_RATIO = 2.6
+KEEP_RATIO = 1.6
+# Absolute bounds (int16 RMS). The old 2000 ceiling is what made you shout.
+MIN_START_RMS = 140.0
+MAX_START_RMS = 1100.0
+MIN_KEEP_RMS = 90.0
+
+# Room tracking: a low percentile over the last few seconds of listening.
+_AMBIENT_WINDOW = 60        # chunks (~5s at 80ms)
+_AMBIENT_PERCENTILE = 20
+_DEFAULT_AMBIENT = 60.0
+_levels = collections.deque(maxlen=_AMBIENT_WINDOW)
 
 
 def _rms(block):
     return float(np.sqrt(np.mean(block.astype(np.float32) ** 2)))
 
 
+def note_ambient(block):
+    """Called with every chunk the wake loop reads. Cheap: one RMS."""
+    _levels.append(_rms(block))
+
+
+def ambient():
+    """The room's background level: the quiet end of recent listening."""
+    if len(_levels) < 8:
+        return _DEFAULT_AMBIENT
+    return max(10.0, float(np.percentile(np.asarray(_levels), _AMBIENT_PERCENTILE)))
+
+
+def gates(room=None):
+    """(start, keep) RMS thresholds for this room."""
+    room = ambient() if room is None else room
+    start = min(MAX_START_RMS, max(MIN_START_RMS, room * START_RATIO)) / SENSITIVITY
+    keep = max(MIN_KEEP_RMS, room * KEEP_RATIO) / SENSITIVITY
+    return start, min(keep, start * 0.8)
+
+
+def normalize(samples, target_peak=0.6, max_gain=6.0):
+    """Lifts a quiet recording so its loudest part reaches target_peak of
+    full scale -- a soft voice transcribes far better at a normal level. The
+    gain is capped, and recordings whose loudest moment is barely above the
+    room are left alone, so silence isn't boosted into something Whisper
+    "hears" as words."""
+    samples = np.asarray(samples, dtype=np.int16).reshape(-1)
+    if not len(samples):
+        return samples
+    floats = samples.astype(np.float32)
+    peak = float(np.percentile(np.abs(floats), 99.9))
+    if peak < max(200.0, ambient() * 3.0):
+        return samples
+    gain = min(max_gain, (32767.0 * target_peak) / peak)
+    if gain <= 1.05:
+        return samples
+    return np.clip(floats * gain, -32768, 32767).astype(np.int16)
+
+
 def record_until_silence(stream, chunk_size, samplerate=16000, on_endpoint=None,
                          give_up_after=None):
     """Reads from an already-open sounddevice stream (int16, mono) until the
-    speaker stops. Returns an int16 numpy array.
+    speaker stops. Returns an int16 numpy array (or None, see give_up_after).
 
     Does NOT open its own stream -- that would make two streams fight over
     the mic.
@@ -52,7 +122,7 @@ def record_until_silence(stream, chunk_size, samplerate=16000, on_endpoint=None,
     on_endpoint: optional callback fired the instant we decide speech ended,
     before frames are concatenated.
 
-    give_up_after: optional seconds. If nothing has crossed the speech gate by
+    give_up_after: optional seconds. If nothing has crossed the start gate by
     then, returns None instead of waiting out MAX_RECORD_SECONDS. Only useful
     where silence is a legitimate answer -- a follow-up question rather than a
     command that was deliberately triggered.
@@ -60,12 +130,14 @@ def record_until_silence(stream, chunk_size, samplerate=16000, on_endpoint=None,
     ui.set_state(ui.RECORDING)
     print("Recording... (speak now)")
 
-    frames = []
-    noise_samples = []
-    gate = MIN_SPEECH_RMS
+    room = ambient()
+    start_gate, keep_gate = gates(room)
 
-    silence_start = None
+    frames = []
+    started = False
     speech_seconds = 0.0
+    loudest = 0.0
+    silence_start = None
     start_time = time.time()
     chunk_seconds = chunk_size / float(samplerate)
 
@@ -76,37 +148,31 @@ def record_until_silence(stream, chunk_size, samplerate=16000, on_endpoint=None,
 
         frames.append(data.copy())
         level = _rms(data)
+        loudest = max(loudest, level)
         elapsed = time.time() - start_time
-
         ui.push_rms(level)
 
-        # calibrate the gate off the opening chunks
-        if len(noise_samples) < NOISE_FLOOR_CHUNKS:
-            noise_samples.append(level)
-            if len(noise_samples) == NOISE_FLOOR_CHUNKS:
-                floor = float(np.median(noise_samples))
-                gate = min(
-                    MAX_SPEECH_RMS,
-                    max(MIN_SPEECH_RMS, floor * SPEECH_MULTIPLIER),
-                )
-            continue
-
+        gate = keep_gate if started else start_gate
         if level > gate:
             speech_seconds += chunk_seconds
+            if speech_seconds >= MIN_SPEECH_SECONDS:
+                started = True
             silence_start = None
-        elif elapsed > GRACE_PERIOD and speech_seconds >= MIN_SPEECH_SECONDS:
-            if silence_start is None:
-                silence_start = time.time()
-            elif time.time() - silence_start >= SILENCE_HANGOVER:
-                break
+        else:
+            if level < start_gate * 0.5:
+                _levels.append(level)  # quiet chunks keep teaching the room
+            # Only a pause AFTER you've started can end it, and never in the
+            # opening moments of a short phrase.
+            if started and elapsed > min(GRACE_PERIOD, speech_seconds + SILENCE_SECONDS):
+                if silence_start is None:
+                    silence_start = time.time()
+                elif time.time() - silence_start >= SILENCE_SECONDS:
+                    break
 
-        # Nobody started talking. Checked against the same speech_seconds the
-        # endpointer uses, so a cough that never became words doesn't count as
-        # an answer and hold the mic open.
-        if (give_up_after is not None
-                and elapsed > give_up_after
-                and speech_seconds < MIN_SPEECH_SECONDS):
+        # Nobody started talking.
+        if give_up_after is not None and elapsed > give_up_after and not started:
             print("Nothing said.")
+            _log(room, start_gate, keep_gate, loudest, speech_seconds, elapsed, "nothing said")
             return None
 
         if elapsed > MAX_RECORD_SECONDS:
@@ -119,5 +185,20 @@ def record_until_silence(stream, chunk_size, samplerate=16000, on_endpoint=None,
         except Exception:
             pass
 
-    print("Done recording ({:.2f}s).".format(time.time() - start_time))
+    took = time.time() - start_time
+    print("Done recording ({:.2f}s).".format(took))
+    _log(room, start_gate, keep_gate, loudest, speech_seconds, took, "ok")
     return np.concatenate(frames, axis=0)
+
+
+def _log(room, start_gate, keep_gate, loudest, speech, took, outcome):
+    """One dev-log row per recording, so the gates can be tuned from real
+    numbers instead of guesses."""
+    try:
+        from commands import devlog
+        devlog.stt("mic", "record", "INFO", detail=(
+            "{} | room {:.0f} start {:.0f} keep {:.0f} loudest {:.0f} speech {:.1f}s "
+            "sens {:.2f}".format(outcome, room, start_gate, keep_gate, loudest, speech,
+                                 SENSITIVITY)), seconds=took)
+    except Exception:
+        pass

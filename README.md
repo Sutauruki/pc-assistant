@@ -90,6 +90,8 @@ No manual download step.
 | Variable | Used by | Required |
 |---|---|---|
 | `GROQ_TTS_API_KEY` | Groq Whisper speech-to-text (`listener/stt_groq.py`), fast and accurate, with Moonshine as the fallback. A separate key from `GROQ_API_KEY` so hearing and parsing use different limits. Unset = offline Moonshine only | optional |
+| `MIC_SENSITIVITY` | how quiet speech can be and still count: higher hears softer voices (`1.5`), lower ignores more room noise (`0.7`); default `1.0` | optional |
+| `RECORD_SILENCE_SECONDS` | how long a pause ends a recording; default `1.2` (raise it if you get cut off) | optional |
 | `STT_ENGINE` | `moonshine` keeps hearing offline even when a Groq key is set | optional |
 | `MOONSHINE_COMPRESSION` | Moonshine STT model size (`listener/stt_moonshine.py`); default `medium_streaming` | optional |
 | `FISH_API_KEY` | primary TTS voice, Fish Audio S2.1 Pro (`listener/tts_fish.py`); without it Moonshine speaks | recommended |

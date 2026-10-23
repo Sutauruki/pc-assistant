@@ -56,7 +56,7 @@ import numpy as np
 import sounddevice as sd
 
 from listener.wake_word import load_wake_word_model, check_wake_word
-from listener.record import record_until_silence
+from listener.record import note_ambient, record_until_silence
 from listener import console_input
 from listener import cues
 from listener import stt_groq
@@ -1327,6 +1327,9 @@ def _voice_loop(model, stream, typing):
         data, overflowed = stream.read(CHUNK_SIZE)
         if overflowed:
             print("input overflow (listening)")
+        # Learn the room's noise while waiting, so a recording's speech gate
+        # is set before you talk rather than measured on your voice.
+        note_ambient(data)
 
         # Feed the idle wave off the same chunks the wake word model sees --
         # the panel twitches with the room, which is the cheap way to show

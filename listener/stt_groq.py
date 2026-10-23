@@ -119,6 +119,9 @@ def transcribe(audio):
     if rms < MIN_RMS:
         return ""
 
+    from listener.record import normalize
+    samples = normalize(samples)  # after the silence check, so quiet stays quiet
+
     try:
         result = _get_client().audio.transcriptions.create(
             file=("speech.wav", _wav(samples)),

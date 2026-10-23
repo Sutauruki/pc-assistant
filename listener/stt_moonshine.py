@@ -142,6 +142,8 @@ def transcribe(audio):
     # The recorder hands back a (N, 1) mono array, so flatten before
     # converting -- the API takes a flat List[float], and a tall list of
     # one-element lists makes ctypes raise "must be real number, not list".
+    from listener.record import normalize
+    audio = normalize(audio)  # a soft voice transcribes better at a normal level
     floats = (audio.astype(np.float32).reshape(-1) / 32768.0).tolist()
 
     result = _transcriber().transcribe_without_streaming(
