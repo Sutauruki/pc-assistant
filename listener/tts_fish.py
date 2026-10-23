@@ -365,5 +365,4 @@ if __name__ == "__main__":
     if not available():
         print("tts_fish: set FISH_API_KEY in .env first")
     else:
-        speak("Fish Audio voice is working. Gimme that tomato sauce! "
-              "With the potato! And that bottle of water!")
+        speak("If it is your wish, I will follow you anywhere, even if your throne crumbles, and your shiny crown turns to rust. Even if the bodies pile up endlessly above the bottomless pile of corpses. Beside you as you lie down softly, I will be, until I hear the words 'Check Mate'!")
