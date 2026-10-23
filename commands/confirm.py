@@ -105,6 +105,17 @@ def question():
         return entry["question"] if entry else None
 
 
+def set_context(text, kinds=()):
+    """What the user originally asked, and which actions were in that turn --
+    so main.py can answer "how much RAM am I using" in words once the
+    approved command has run, instead of reading its raw output aloud."""
+    with _lock:
+        entry = _live()
+        if entry is not None:
+            entry["asked"] = str(text or "")
+            entry["kinds"] = [k for k in kinds if k]
+
+
 def needs_physical():
     """True when the pending question can't be answered by voice."""
     with _lock:

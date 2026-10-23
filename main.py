@@ -145,14 +145,14 @@ SPOKEN_RESULTS = {
     "stop_preview",
     # The computer agent speaks its own result (and its own approval
     # questions, mid-task); research_explain's result is the explanation.
-    "computer_task", "research_explain",
+    "computer_task", "research_explain", "system_info",
 }
 
 # Actions whose result is already a finished spoken answer. In mode "both"
 # these skip the second pass through the chat model that would only
 # paraphrase them -- a whole extra model round trip for nothing.
 DIRECT_ANSWERS = {"computer_task", "browser_run", "research_explain",
-                  "research_save", "understand_screen"}
+                  "research_save", "understand_screen", "system_info"}
 
 # How many times to re-record for an answer to a pending confirmation before
 # giving up on it. Two is enough for one misheard reply; more than that and
@@ -501,6 +501,7 @@ def _resolve_confirmation(text, voice, typed=False):
 
     if verdict is True:
         print("confirm: yes -> {}".format(question))
+        parked = confirm.pending() or {}
         # The parked callable is whatever asked the question, and the common one
         # is a delete -- send2trash on Windows drives IFileOperation, which is
         # COM. run_actions() initialises COM around the executor, but this runs
@@ -511,6 +512,13 @@ def _resolve_confirmation(text, voice, typed=False):
             result = confirm.accept()
         finally:
             comtypes.CoUninitialize()
+        if result and "run_command" in parked.get("kinds", ()) and parked.get("asked"):
+            # An approved shell command's output is raw -- "FreePhysicalMemory=
+            # 2677600" -- so answer the original question from it, the same
+            # way a "both" turn does, instead of reading it out.
+            answer = _answer_parked(parked["asked"], result, voice)
+            if answer:
+                return True
         if result:
             print(result)
             ui.set_reply(result)
@@ -528,6 +536,26 @@ def _resolve_confirmation(text, voice, typed=False):
     print("confirm: unrelated reply, dropping the question")
     confirm.clear()
     return False
+
+
+def _answer_parked(asked, result, voice):
+    """Answers `asked` in plain words from an approved command's output.
+    Returns the spoken answer, or None so the caller falls back to reading
+    the result out."""
+    question = _chat_context(asked, [{"action": "run_command"}], [result])
+    ui.set_state(ui.THINKING)
+    try:
+        answer = voice.stream(lambda put: chat.answer(question, on_sentence=put))
+    except Exception as e:
+        print("couldn't explain the result ({})".format(e))
+        return None
+    if not answer:
+        return None
+    print('Jarvis says: "{}"'.format(answer))
+    ui.set_reply(answer)
+    remember(asked, answer)
+    voice.wait()
+    return answer
 
 
 def _answer_from_toast(text):
@@ -828,6 +856,7 @@ def _run_turn(text, t_start, marks):
     # A parked question is the last word of the turn -- it has to be, since the
     # answer is the next thing the user says.
     if confirm.is_pending():
+        confirm.set_context(text, [a.get("action") for a in ordered if isinstance(a, dict)])
         question = confirm.question()
         print('Jarvis asks: "{}"'.format(question))
         ui.set_reply(question)

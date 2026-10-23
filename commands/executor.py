@@ -50,6 +50,7 @@ from commands import research
 from commands import screen_actions
 from commands import sheets
 from commands import slides
+from commands import system_info
 from commands import web_search
 from commands import website_builder
 from commands import window_actions
@@ -270,6 +271,13 @@ def _run_one(action):
             notifications.notify,
             _first(action, "title", "heading", default="Jarvis"),
             _first(action, "message", "body", "text"),
+        )
+
+    # --- system status (RAM, CPU, disk, battery, uptime) ----------------------
+    if kind in ("system_info", "system_status", "check_ram", "memory_usage"):
+        return _call(
+            system_info.system_info,
+            _first(action, "what", "target", "topic", default="all"),
         )
 
     # --- screen -------------------------------------------------------------

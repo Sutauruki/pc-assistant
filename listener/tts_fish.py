@@ -20,6 +20,8 @@ FISH_VOICE_ID   optional voice model id (`reference_id`) from fish.audio;
 FISH_MODEL      optional model header; default s2.1-pro-free
 FISH_LATENCY    low | normal | balanced (default balanced); low starts
                 talking sooner at a slight cost in voice quality
+FISH_VOLUME_DB  loudness boost in dB, applied by Fish (prosody.volume);
+                default 3. 0 = Fish's own level; 6 is about 1.4x louder again.
 FISH_SAMPLE_RATE  8000 | 16000 | 24000 | 32000 | 44100 (default 44100, Fish's
                 native rate -- nothing is downsampled). main.py opens the
                 speaker at this rate from the start, so it never has to
@@ -57,6 +59,16 @@ if LATENCY not in _LATENCIES:
     print("tts_fish: FISH_LATENCY={!r} isn't one of {}; using balanced".format(
         LATENCY, ", ".join(_LATENCIES)))
     LATENCY = "balanced"
+
+# Fish evens out loudness (normalize_loudness) and Jarvis plays it as-is,
+# which came out quieter than the Fish website's player. prosody.volume asks
+# Fish to raise it server-side, where it's mastered, rather than amplifying
+# samples here and risking clipping. Clamped to a sane range.
+try:
+    VOLUME_DB = float(os.getenv("FISH_VOLUME_DB", "3").strip() or 3)
+except ValueError:
+    VOLUME_DB = 3.0
+VOLUME_DB = max(-12.0, min(12.0, VOLUME_DB))
 
 # The rates Fish offers for raw PCM. 44100 is what the model produces, so
 # it's sent untouched; lower rates are downsampled on Fish's side. The speaker
@@ -150,6 +162,8 @@ def _body(text):
         "latency": LATENCY,
         "normalize": True,
     }
+    if VOLUME_DB:
+        body["prosody"] = {"volume": VOLUME_DB}
     if VOICE_ID:
         body["reference_id"] = VOICE_ID
     return body
@@ -170,7 +184,7 @@ _CACHE_MAX_FILES = 300  # ~3s of 44.1kHz PCM is ~260KB, so ~80MB at the very mos
 
 
 def _cache_path(text):
-    key = "|".join((MODEL, VOICE_ID, str(SAMPLE_RATE), LATENCY,
+    key = "|".join((MODEL, VOICE_ID, str(SAMPLE_RATE), LATENCY, str(VOLUME_DB),
                     " ".join(str(text).split())))
     return _CACHE_DIR / (hashlib.sha1(key.encode("utf-8")).hexdigest() + ".pcm")
 
