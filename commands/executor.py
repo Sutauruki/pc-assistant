@@ -346,6 +346,15 @@ def _run_one(action):
             recall.remember,
             _first(action, "text", "fact", "value", "content"),
         )
+    if kind in ("set_profile", "profile"):
+        return _call(
+            recall.set_profile,
+            _first(action, "field", "key", default="about"),
+            _first(action, "value", "text", default=""),
+        )
+    if kind in ("get_to_know_me", "onboarding", "interview"):
+        from commands import onboarding
+        return _call(onboarding.start)
     if kind in ("forget_fact", "forget_this"):
         return _call(
             recall.forget, _first(action, "text", "fact", "value", default="")

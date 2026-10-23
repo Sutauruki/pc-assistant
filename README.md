@@ -231,10 +231,14 @@ with `--force-renderer-accessibility` (add it to the shortcut's Target).
 | Kind | Example | Kept |
 |---|---|---|
 | Preferences | "keep answers short" | forever (`jarvis_prefs.json`) |
+| Profile | your name, what to call you, where you live, what you do — in **every** prompt | forever (`data/profile.json`) |
 | Facts | "my sister is Tolu, saved as Tolu Ade on WhatsApp" | forever (`data/facts.json`) |
 | Conversation | the last few turns | across restarts within 6 hours (`data/conversation.jsonl`) |
 
-Say "remember that..." -- or just mention a lasting fact ("text my sister
+Say **"get to know me"** for a quick interview (name, city, work, the people
+you message, how you like answers, interests): one question at a time, no wake
+word needed between them, "skip" or "stop" any time, and it picks up where you
+left off if you go quiet. Or say "remember that..." -- or just mention a lasting fact ("text my sister
 Tolu...") and Jarvis keeps it. "Forget that..." removes it; "what do you
 remember" lists it. Each turn pulls in only the few facts relevant to what you
 said (a local keyword match, well under a millisecond), so memory never slows

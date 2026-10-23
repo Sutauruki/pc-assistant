@@ -223,8 +223,11 @@ def _prompt(task, step, history, notes, obs):
     try:
         from commands import recall
         known = recall.relevant(task)
+        who = recall.profile_block()
     except Exception:
-        known = []
+        known, who = [], ""
+    if who:
+        parts.append(who)
     if known:
         parts.append("Things the user told you before (use them, e.g. contact "
                      "names):\n" + "\n".join("- " + k for k in known))

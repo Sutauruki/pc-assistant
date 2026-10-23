@@ -11,6 +11,11 @@ restart). This adds:
                 "mum is saved as Mama on WhatsApp", "my project folder is
                 D:\\work\\motive". Saved forever (data/facts.json), up to
                 MAX_FACTS.
+  profile       the few things that are ALWAYS relevant -- your name, what to
+                call you, where you live, what you do (data/profile.json).
+                Unlike facts, these go into every prompt, keyword match or
+                not: "what do you know about me" has no words in common with
+                "the user's name is Ezekiel". About 50 tokens.
   conversation  every turn, appended to data/conversation.jsonl. On start-up
                 the last few turns from the past HISTORY_MAX_AGE come back,
                 so restarting mid-task doesn't make Jarvis forget it.
@@ -227,15 +232,104 @@ def set_focus(text):
 
 
 def prompt_block(query=None):
-    """Relevant facts as prompt text, or "" when none apply."""
+    """The profile (always) plus the facts relevant to this turn, as prompt
+    text, or "" when there's nothing."""
+    head = profile_block()
     found = relevant(_focus if query is None else query)
     if not found:
-        return ""
-    lines = ["THINGS THE USER HAS TOLD YOU BEFORE",
+        return head
+    lines = ([head, ""] if head else []) + ["THINGS THE USER HAS TOLD YOU BEFORE",
              "Remembered from earlier conversations. Use them when they help;"
              " don't recite them."]
     lines += ["- {}".format(t) for t in found]
     return "\n".join(lines)
+
+
+# --- Profile ----------------------------------------------------------------
+
+PROFILE_FIELDS = ("name", "call_me", "location", "work", "about")
+_FIELD_ALIASES = {
+    "name": "name", "full name": "name",
+    "call me": "call_me", "call_me": "call_me", "nickname": "call_me",
+    "address me": "call_me",
+    "location": "location", "city": "location", "live": "location",
+    "lives": "location", "where": "location", "based": "location",
+    "work": "work", "job": "work", "occupation": "work", "study": "work",
+    "school": "work", "profession": "work",
+    "about": "about", "bio": "about",
+}
+_profile = None
+
+
+def _profile_path():
+    return data_dir() / "profile.json"
+
+
+def profile():
+    """{"name", "call_me", "location", "work", "about"} -- empty strings for
+    anything not yet known."""
+    global _profile
+    with _lock:
+        if _profile is None:
+            _profile = {f: "" for f in PROFILE_FIELDS}
+            try:
+                raw = json.loads(_profile_path().read_text(encoding="utf-8"))
+                for f in PROFILE_FIELDS:
+                    _profile[f] = str(raw.get(f) or "")[:MAX_FACT_CHARS]
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError, AttributeError) as e:
+                print("recall: couldn't read profile ({})".format(e))
+        return dict(_profile)
+
+
+def set_profile(field, value):
+    """Sets one profile field. Returns a spoken result."""
+    global _profile
+    key = _FIELD_ALIASES.get(str(field or "").strip().lower().replace("_", " "),
+                             str(field or "").strip().lower())
+    if key not in PROFILE_FIELDS:
+        return "I don't keep a profile field called {}.".format(field)
+    value = " ".join(str(value or "").split())[:MAX_FACT_CHARS].strip(" .")
+    reason = secret_reason(value) if value else None
+    if reason:
+        return "I won't store that -- {}.".format(reason)
+    with _lock:
+        current = profile()
+        current[key] = value
+        _profile = current
+        try:
+            path = _profile_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_suffix(".tmp")
+            temp.write_text(json.dumps(current, indent=1, ensure_ascii=False), encoding="utf-8")
+            os.replace(str(temp), str(path))
+        except OSError as e:
+            return "I couldn't save that: {}".format(e)
+    if not value:
+        return "Forgotten."
+    labels = {"name": "your name", "call_me": "what to call you", "location": "where you are",
+              "work": "what you do", "about": "that about you"}
+    return "Got it -- I'll remember {}.".format(labels[key])
+
+
+def profile_block():
+    """The profile as prompt text, or "" when nothing is known yet."""
+    p = profile()
+    parts = []
+    if p["name"]:
+        parts.append("Name: {}".format(p["name"]))
+    if p["call_me"]:
+        parts.append("Call them: {}".format(p["call_me"]))
+    if p["location"]:
+        parts.append("Lives in: {}".format(p["location"]))
+    if p["work"]:
+        parts.append("Does: {}".format(p["work"]))
+    if p["about"]:
+        parts.append("Also: {}".format(p["about"]))
+    if not parts:
+        return ""
+    return "WHO THE USER IS\n" + "\n".join("- " + x for x in parts)
 
 
 # --- Conversation -----------------------------------------------------------
@@ -302,11 +396,25 @@ def recent(limit, max_age=HISTORY_MAX_AGE):
 
 
 def describe():
-    """One line for "what do you remember", or "" when there are no facts."""
+    """One line for "what do you remember", or "" when nothing's known."""
+    p = profile()
+    who = []
+    if p["name"]:
+        who.append("you're {}".format(p["name"]) + (
+            ", and I call you {}".format(p["call_me"]) if p["call_me"] and p["call_me"] != p["name"] else ""))
+    elif p["call_me"]:
+        who.append("I call you {}".format(p["call_me"]))
+    if p["location"]:
+        who.append("you're in {}".format(p["location"]))
+    if p["work"]:
+        who.append("what you do: {}".format(p["work"]))
     known = facts()
-    if not known:
-        return ""
-    head = "; ".join(known[-5:])
-    more = len(known) - 5
-    return "Things you've told me: {}{}".format(
-        head, ", and {} more".format(more) if more > 0 else "")
+    parts = []
+    if who:
+        parts.append("I know " + ", ".join(who))
+    if known:
+        head = "; ".join(known[-5:])
+        more = len(known) - 5
+        parts.append("Things you've told me: {}{}".format(
+            head, ", and {} more".format(more) if more > 0 else ""))
+    return ". ".join(parts)

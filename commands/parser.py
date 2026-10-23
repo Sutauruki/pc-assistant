@@ -190,6 +190,8 @@ MEMORY
 - {"action": "forget_preference", "text": "<which one, or omit for all>"}
 - {"action": "remember_this", "text": "<a lasting fact, written in the third person>"}
 - {"action": "forget_fact", "text": "<which fact to forget>"}
+- {"action": "set_profile", "field": "name"|"call_me"|"location"|"work"|"about", "value": "<what they said>"}
+- {"action": "get_to_know_me"}
 - {"action": "list_memory"}
 
 SHELL
@@ -371,6 +373,15 @@ likes and dislikes. Write it in the third person so it reads well later:
 action -- they shouldn't have to say "remember". Never for passwords, PINs,
 codes, card or account numbers (they're refused anyway). "forget that ..."
 about a fact -> forget_fact; about how you behave -> forget_preference.
+
+"set_profile" is for the few things about the user that are always relevant:
+their name ("my name is Ezekiel" -> name), what to call them ("call me Zeke"
+-> call_me), where they live ("I'm in Lagos" -> location), what they do ("I'm
+a developer" -> work). Use it instead of remember_this for those -- the
+profile goes into every prompt. Emit it in passing too, alongside whatever
+else the turn needs.
+"get_to_know_me": "get to know me", "learn about me", "ask me about myself",
+"set up my profile" -- a short interview. Mode "command", reply "Sure."
 
 A CORRECTION IS A PREFERENCE.
 This is the important one. When the user pushes back on how you did something --

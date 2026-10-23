@@ -74,6 +74,7 @@ from commands import devlog
 from commands import logbook
 from commands import memory
 from commands import notify
+from commands import onboarding
 from commands import recall
 from commands.parser import parse_command, generate_reply, remember
 from commands.executor import execute_actions
@@ -146,7 +147,8 @@ SPOKEN_RESULTS = {
     "stop_preview",
     # The computer agent speaks its own result (and its own approval
     # questions, mid-task); research_explain's result is the explanation.
-    "computer_task", "research_explain", "system_info",
+    "computer_task", "research_explain", "system_info", "get_to_know_me",
+    "set_profile",
 }
 
 # Actions whose result is already a finished spoken answer. In mode "both"
@@ -155,7 +157,8 @@ SPOKEN_RESULTS = {
 # Results meant to be READ -- the window opens for a while to show them
 # (window_ui.peek), then shrinks back to the orb on its own.
 SHOWN_RESULTS = {"list_files", "find_file", "list_windows", "read_clipboard",
-                 "run_command", "list_memory", "where_is", "explain_command"}
+                 "run_command", "list_memory", "where_is", "explain_command",
+                 "get_to_know_me"}
 _SHOW_ME = re.compile(r"\b(show me|show it|display|on (the |your )?(screen|window))\b", re.I)
 
 DIRECT_ANSWERS = {"computer_task", "browser_run", "research_explain",
@@ -722,6 +725,19 @@ def _run_turn(text, t_start, marks):
     # Long-term facts relevant to these words go into this turn's prompts.
     recall.set_focus(text)
 
+    # The get-to-know-me interview owns the next thing said while it runs.
+    if onboarding.active():
+        line = onboarding.answer(text)
+        if line:
+            print('Jarvis asks: "{}"'.format(line))
+            ui.set_reply(line)
+            remember(text, line)
+            if onboarding.active():
+                window_ui.peek()  # keep the questions on screen
+            voice.say(line, background=False)
+            _finish(marks, t_start)
+            return
+
     # A parked question owns the next thing said, whatever it was going to be.
     if confirm.is_pending():
         if _resolve_confirmation(text, voice, typed=bool(marks.get("typed"))):
@@ -1203,9 +1219,18 @@ def _follow_up(stream, model, typing):
     # confirmation pays the cooldown twice.
     settled = True
 
-    for _ in range(MAX_CONFIRM_FOLLOWUPS):
-        if not confirm.is_pending():
+    # Each pass waits for one answer. A confirmation gets MAX_CONFIRM_FOLLOWUPS
+    # passes in all. The get-to-know-me interview keeps going for as long as
+    # answers keep coming -- one question per pass -- and pauses on the first
+    # pass where nothing was said or typed (see the end of this function).
+    passes = 0
+    while True:
+        if not (confirm.is_pending() or onboarding.active()):
             return
+        if not onboarding.active():
+            passes += 1
+            if passes > MAX_CONFIRM_FOLLOWUPS:
+                break
 
         settled = False
 
@@ -1242,6 +1267,12 @@ def _follow_up(stream, model, typing):
         # EXPIRY_SECONDS regardless, just less predictably.
         print("confirm: no clear answer, dropping the question")
         confirm.clear()
+
+    if onboarding.active():
+        # Quiet: pause rather than let the next "hey Jarvis, open Chrome" be
+        # taken as an answer. "get to know me" resumes at the same question.
+        print("onboarding: no answer, pausing the interview")
+        onboarding.pause()
 
     if not settled:
         # Reached by giving up rather than by answering, including the case
