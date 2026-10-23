@@ -78,6 +78,24 @@ Ctrl+J. _read_posix() now clears ICRNL for the duration of the reader (see
 its docstring), so Enter reliably arrives as "\r" and Ctrl+J as "\n" --
 the same distinction _handle() relies on.
 
+PASTING (CTRL+V)
+----------------
+Two different things arrive depending on the terminal, and both are handled:
+
+  * Windows Terminal / VS Code intercept Ctrl+V themselves and "type" the
+    clipboard in as ordinary key events. Every line break in the pasted text
+    arrives as an Enter key -- which used to submit the first line and lose
+    the rest. An Enter with more key presses already waiting behind it can't
+    have been typed by a hand (nobody types the next key within one poll), so
+    it's treated as a line break inside the paste, not a submit.
+  * The classic console (conhost) delivers Ctrl+V to a raw reader as a plain
+    control key. That is caught by virtual key + Ctrl and the clipboard is read
+    directly (pyperclip) and inserted.
+
+Either way the pasted text lands in the prompt for you to check, and Enter
+sends it. A paste whose final line ends in a newline sends straight away, the
+same as pasting a command into a shell.
+
 POLLED, NOT BLOCKING
 --------------------
 msvcrt.getwch() cannot be interrupted or given a timeout, so a thread sitting
@@ -101,11 +119,12 @@ from listener import ui
 # visible effect; above ~50ms typing starts to feel spongy.
 POLL_SECONDS = 0.025
 
-# Longest line accepted. Guards against a paste of something enormous -- the
-# parser has to send it to the model, and the model has a context limit.
-MAX_INPUT_CHARS = 500
+# Longest input accepted. Guards against a paste of something enormous -- the
+# parser has to send it to the model, and the model has a context limit. Big
+# enough for a pasted paragraph or a message you want Jarvis to send.
+MAX_INPUT_CHARS = 2000
 
-HINT = "type a command (shift+enter or ctrl+j for a new line), or say \"hey jarvis\""
+HINT = "type or ctrl+v a command (shift+enter or ctrl+j for a new line), or say \"hey jarvis\""
 
 # --- control characters ----------------------------------------------------
 
@@ -115,6 +134,7 @@ _CTRL_J = "\x0a"  # Ctrl+J / linefeed -- the cross-terminal newline shortcut,
                   # see "SHIFT+ENTER, AND WHY CTRL+J IS HERE TOO" above.
 _CTRL_L = "\x0c"  # Ctrl+L -- toggles the history overlay (listener/ui.py).
 _CTRL_U = "\x15"
+_CTRL_V = "\x16"  # Ctrl+V where the terminal passes it through instead of pasting
 _CTRL_W = "\x17"
 _BACKSPACE = ("\x08", "\x7f")
 # "\n" used to live here too, back when Enter and Ctrl+J were
@@ -165,6 +185,27 @@ def _insert_newline():
     if len(_buffer) < MAX_INPUT_CHARS:
         _buffer += "\n"
         _publish()
+
+
+def _paste(text=None):
+    """Inserts clipboard text (or `text`) into the prompt. Line breaks stay
+    line breaks, tabs become spaces, other control characters are dropped,
+    and the MAX_INPUT_CHARS cap still applies."""
+    global _buffer
+    if text is None:
+        try:
+            import pyperclip
+            text = pyperclip.paste()
+        except Exception as e:
+            print("couldn't read the clipboard: {}".format(e))
+            return
+    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+    text = "".join(ch for ch in text if ch == "\n" or ch >= " ")
+    room = MAX_INPUT_CHARS - len(_buffer)
+    if room <= 0 or not text:
+        return
+    _buffer += text[:room]
+    _publish()
 
 
 def _kill_word():
@@ -236,6 +277,10 @@ def _handle(char):
         _clear()
         return True
 
+    if char == _CTRL_V:
+        _paste()
+        return True
+
     if char == _CTRL_W:
         _kill_word()
         return True
@@ -266,6 +311,8 @@ def _handle(char):
 _VK_RETURN = 0x0D
 _VK_J = 0x4A
 _VK_L = 0x4C
+_VK_V = 0x56
+_VK_INSERT = 0x2D
 _SHIFT_PRESSED = 0x0010  # dwControlKeyState bit; ignores caps/num lock etc.
 _LEFT_CTRL_PRESSED = 0x0008
 _RIGHT_CTRL_PRESSED = 0x0004
@@ -327,6 +374,21 @@ def _read_windows():
     kernel32.ReadConsoleInputW.restype = wintypes.BOOL
     kernel32.ReadConsoleInputW.argtypes = kernel32.PeekConsoleInputW.argtypes
 
+    ahead = (InputRecord * 32)()
+    ahead_count = wintypes.DWORD(0)
+
+    def more_keys_waiting():
+        """True when another key press is already queued behind this one --
+        the signature of pasted text, which arrives all at once."""
+        if not kernel32.PeekConsoleInputW(
+                handle, ahead, len(ahead), ctypes.byref(ahead_count)):
+            return False
+        for i in range(ahead_count.value):
+            rec = ahead[i]
+            if rec.EventType == _KEY_EVENT and rec.Event.KeyEvent.bKeyDown:
+                return True
+        return False
+
     handle = kernel32.GetStdHandle(_STD_INPUT_HANDLE)
     record = InputRecord()
     count = wintypes.DWORD(0)
@@ -354,10 +416,19 @@ def _read_windows():
             continue  # the matching key-up for a press already handled
 
         if key.wVirtualKeyCode == _VK_RETURN:
-            if key.dwControlKeyState & _SHIFT_PRESSED:
+            if key.dwControlKeyState & _SHIFT_PRESSED or more_keys_waiting():
+                # Shift+Enter, or a line break inside a paste (see PASTING).
                 _insert_newline()
             else:
                 _submit()
+            continue
+
+        # Ctrl+V (and Shift+Insert) that the terminal didn't turn into a
+        # paste itself -- the classic console. Read the clipboard directly.
+        if ((key.wVirtualKeyCode == _VK_V and key.dwControlKeyState & _CTRL_PRESSED)
+                or (key.wVirtualKeyCode == _VK_INSERT
+                    and key.dwControlKeyState & _SHIFT_PRESSED)):
+            _paste()
             continue
 
         # Second, independent path to the same action -- see "SHIFT+ENTER,

@@ -143,6 +143,10 @@ SPARK_WIDTH = 24
 # never moves -- this is purely an overlay that clears on its own.
 TOAST_SECONDS = 4.0
 
+# Most typed/pasted lines drawn in the prompt area. Older lines of a long
+# paste collapse into one "... N more lines above" row.
+INPUT_MAX_ROWS = 4
+
 # Cap on buffered log lines kept for the history overlay (ctrl+L).
 HISTORY_MAX = 200
 
@@ -1155,7 +1159,16 @@ class Dashboard(object):
             )]
 
         lines = text.split("\n")
-        rows = [
+        # A pasted paragraph can be dozens of lines; only the last few are
+        # drawn so the panel never outgrows the terminal (and stops drawing).
+        hidden = max(0, len(lines) - INPUT_MAX_ROWS)
+        rows = []
+        if hidden:
+            rows.append(self._text_row(
+                box["sep"], "... {} more line{} above".format(hidden, "" if hidden == 1 else "s"),
+                inner, DIM_RGB, DIM_RGB))
+            lines = lines[hidden:]
+        rows += [
             self._text_row(box["sep"], line, inner, DIM_RGB, TEXT_RGB)
             for line in lines[:-1]
         ]
