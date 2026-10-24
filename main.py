@@ -1186,9 +1186,9 @@ def handle_remote(item):
         _run_turn(text, t_start, marks)
     except Exception:
         marks["remote"].append("Something went wrong running that.")
-        raise
-    finally:
         telegram_bot.reply(item, marks["remote"], before)
+        raise
+    telegram_bot.reply(item, marks["remote"], before)
 
 
 def _guarded_turn(fn, arg):
@@ -1656,6 +1656,12 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
+        # Stop the Telegram poller before anything else, so it can't print
+        # into a panel that's being torn down.
+        try:
+            telegram_bot.stop()
+        except Exception:
+            pass
         # Order matters. console_input.stop() first: on POSIX it restores the
         # terminal modes it took, and it talks to ui, so it has to run while
         # ui is still up.

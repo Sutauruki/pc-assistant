@@ -86,6 +86,9 @@ RATE_PER_MINUTE = 20
 MAX_TEXT = 4000              # Telegram's limit is 4096
 MAX_FILE_BYTES = 49 * 1024 * 1024
 MAX_FILES_PER_TURN = 3
+# Right after a restart the previous run's long poll can hold the bot for up
+# to POLL_SECONDS, so only a conflict that outlasts that is reported.
+CONFLICT_GRACE = POLL_SECONDS + 15
 
 _STATE = Path(__file__).resolve().parent.parent / "data" / "telegram.json"
 
@@ -98,6 +101,8 @@ _thread = None
 _status = "off"
 _speak = SPEAK
 _session = None
+_stop = threading.Event()
+_warned = set()
 
 
 # ---------------------------------------------------------------------------
@@ -164,11 +169,14 @@ def _http():
     return _session
 
 
-def _call(method, timeout=15, files=None, **params):
+def _call(method, http_timeout=15, files=None, **params):
+    """One Bot API call. `params` go to Telegram as-is -- including its own
+    "timeout" (the long-poll wait), which is why the HTTP timeout has a
+    different name."""
     resp = _http().post("{}/bot{}/{}".format(API, TOKEN, method),
                         data=params if files else None,
                         json=None if files else params,
-                        files=files, timeout=timeout)
+                        files=files, timeout=http_timeout)
     try:
         body = resp.json()
     except ValueError:
@@ -199,7 +207,7 @@ def _send_file(chat_id, path, photo=False, caption=None):
             _send(chat_id, "{} is too big to send over Telegram.".format(path.name))
             return False
         with open(path, "rb") as fh:
-            _call("sendPhoto" if photo else "sendDocument", timeout=120,
+            _call("sendPhoto" if photo else "sendDocument", http_timeout=120,
                   files={"photo" if photo else "document": (path.name, fh)},
                   chat_id=chat_id, caption=caption or "")
         return True
@@ -224,6 +232,8 @@ def send(text):
 
 def _show_on_pc(title, text):
     """Pairing codes and remote commands are always visible at the PC."""
+    if _stop.is_set():
+        return
     print("telegram: {} -- {}".format(title, text))
     try:
         from commands import notify
@@ -358,35 +368,102 @@ def _get_updates(offset):
     params = {"timeout": POLL_SECONDS, "allowed_updates": ["message"]}
     if offset is not None:
         params["offset"] = offset
-    return _call("getUpdates", timeout=POLL_SECONDS + 10, **params)
+    return _call("getUpdates", http_timeout=POLL_SECONDS + 10, **params)
+
+
+def _warn_once(key, text):
+    """A problem that needs you, said once on the PC rather than silently
+    retried forever."""
+    if key in _warned:
+        return
+    _warned.add(key)
+    _show_on_pc("Telegram", text)
+
+
+_CONFLICT = (
+    "Another program is reading this bot's messages, so Jarvis can't see them "
+    "-- usually Dexter/OpenClaw, a bot-builder site, or a second copy of Jarvis "
+    "still running. Close it, or in @BotFather send /revoke for this bot and "
+    "put the new token in .env (that cuts everything else off).")
+
+
+def _check_bot():
+    """Says who the bot is, and whether a webhook (another service) has
+    claimed it -- while one is set, Telegram hands every message to that
+    service and polling here gets nothing. Returns False to stop."""
+    global _status
+    try:
+        me = _call("getMe")
+        if "me" not in _warned:
+            _warned.add("me")
+            print("telegram: connected as @{}".format(me.get("username")))
+    except Exception as e:
+        text = _scrub(e)
+        if " 401" in text or "Unauthorized" in text or " 404" in text:
+            _status = "off (token rejected)"
+            _warn_once("token", "Telegram rejected TELEGRAM_BOT_TOKEN -- phone control "
+                       "is off. Copy the token from @BotFather again.")
+            return False
+        return True  # offline: the poll loop retries
+    try:
+        hook = _call("getWebhookInfo") or {}
+    except Exception:
+        hook = {}
+    if hook.get("url"):
+        from urllib.parse import urlparse
+        _status = "blocked (bot is connected to another service)"
+        # Not removed automatically: taking a bot off a service you set up
+        # should be your decision.
+        _warn_once("webhook", "This bot is connected to another service ({}), which "
+                   "gets your messages instead of Jarvis. In @BotFather send /revoke "
+                   "for this bot and put the new token in .env.".format(
+                       urlparse(hook["url"]).hostname or "a webhook"))
+    return True
 
 
 def _loop():
     global _status
     offset = None
     backoff = 2
+    conflict_since = None
+    if not _check_bot():
+        return
     # Skip whatever piled up while Jarvis was off.
     try:
-        old = _call("getUpdates", timeout=15, offset=-1)
+        old = _call("getUpdates", offset=-1)
         if old:
             offset = old[-1]["update_id"] + 1
     except Exception:
         pass
-    while True:
+    while not _stop.is_set():
         try:
             updates = _get_updates(offset)
             _status = "on" + (" (paired)" if _owner else " (not paired)")
-            backoff = 2
+            backoff, conflict_since = 2, None
         except Exception as e:
+            if _stop.is_set():
+                return
             text = _scrub(e)
             if " 401" in text or "Unauthorized" in text:
                 _status = "off (token rejected)"
-                print("telegram: Telegram rejected TELEGRAM_BOT_TOKEN -- remote "
-                      "control is off. Check the token from @BotFather.")
+                _warn_once("token", "Telegram rejected TELEGRAM_BOT_TOKEN -- phone "
+                           "control is off. Copy the token from @BotFather again.")
                 return
-            _status = ("waiting (another copy is using this bot)" if " 409" in text
-                       else "reconnecting")
-            time.sleep(backoff)
+            if " 409" in text:
+                conflict_since = conflict_since or time.time()
+                _status = "blocked (another program is using this bot)"
+                if "webhook" in text.lower():
+                    _check_bot()
+                elif time.time() - conflict_since >= CONFLICT_GRACE:
+                    _warn_once("conflict", _CONFLICT)
+                    backoff = 2  # keep trying: it frees up once the other one stops
+            else:
+                _status = "reconnecting"
+                kind = text.split(":", 1)[0][:60]
+                if kind not in _warned:  # print each kind of failure once
+                    _warned.add(kind)
+                    print("telegram: can't reach Telegram ({}) -- retrying".format(text[:200]))
+            _stop.wait(backoff)
             backoff = min(backoff * 2, 60)
             continue
         for update in updates or []:
@@ -395,6 +472,20 @@ def _loop():
                 _handle_update(update)
             except Exception as e:
                 print("telegram: couldn't handle a message ({})".format(_scrub(e)))
+
+
+def stop():
+    """Ends the poller on exit: wakes it out of its long poll so Ctrl+C
+    doesn't leave a thread mid-request while Python shuts down."""
+    _stop.set()
+    session = _session
+    if session is not None:
+        try:
+            session.close()
+        except Exception:
+            pass
+    if _thread is not None:
+        _thread.join(timeout=1.0)
 
 
 def start():
