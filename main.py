@@ -61,6 +61,7 @@ from listener import console_input
 from listener import cues
 from listener import stt_groq
 from listener import stt_moonshine
+from listener import telegram_bot
 from listener import tts_fish
 from listener import tts_moonshine
 from listener import tts
@@ -185,6 +186,9 @@ CONFIRM_SILENCE_SECONDS = 6.0
 CONFIRM_TYPED_SECONDS = 8.0
 
 _FAILURE_WORDS = ("failed", "couldn't", "didn't")
+
+# Said or typed at the PC: forget the paired Telegram account.
+_UNPAIR_TELEGRAM = re.compile(r"^(unpair|disconnect|unlink|forget) (my |the )?telegram\b", re.I)
 
 # Recover from a vanishing input device (an unplugged headset raises
 # PortAudioError on the next stream.read). These bound how hard _listen_loop
@@ -422,6 +426,15 @@ class _Voice:
         self._t_start = t_start
         self._thread = None
         self._text = ""
+        # A Telegram turn collects what's said so it can be sent back, and
+        # keeps the PC quiet unless TELEGRAM_SPEAK / "/speak on" says otherwise.
+        self._collect = marks.get("remote")
+        self._silent = self._collect is not None and not telegram_bot.speak_aloud()
+
+    def _note(self, text):
+        self._marks["said"] = text
+        if self._collect is not None:
+            self._collect.append(text)
 
     def _on_first_audio(self):
         self._marks.setdefault("first_audio", time.perf_counter() - self._t_start)
@@ -434,6 +447,9 @@ class _Voice:
         spoken = str(text)
         self._text = spoken
         logbook.jarvis(spoken)
+        self._note(spoken)
+        if self._silent:
+            return
 
         def run():
             # speak() swallows its own failures, but it does network I/O on a
@@ -469,6 +485,11 @@ class _Voice:
         latency win on a conversational turn.
         """
         self.wait()
+        if self._silent:
+            self._text = str(produce(lambda sentence: None) or "")
+            logbook.jarvis(self._text)
+            self._note(self._text)
+            return self._text
         feeder = tts.SentenceFeeder()
         t_s0 = time.perf_counter()
 
@@ -492,6 +513,7 @@ class _Voice:
 
         self._text = str(text or "")
         logbook.jarvis(self._text)
+        self._note(self._text)
         if self._text.strip():
             ui.set_engine(tts=tts.last_engine())
             devlog.tts(tts.last_engine(), "speak", "OK",
@@ -509,7 +531,7 @@ class _Voice:
         self._thread = None
 
 
-def _resolve_confirmation(text, voice, typed=False):
+def _resolve_confirmation(text, voice, typed=False, remote=False):
     """Handles a turn that is an answer to a parked question.
 
     Returns True if the text was consumed as an answer. None from interpret()
@@ -520,11 +542,16 @@ def _resolve_confirmation(text, voice, typed=False):
     question = confirm.question()
     verdict = confirm.interpret(text)
 
-    if verdict is True and confirm.needs_physical() and not typed:
+    if verdict is True and confirm.needs_physical() and (remote or not typed):
         # A spoken yes can't approve this one (confirm.py, PHYSICAL
-        # CONFIRMATIONS). Keep it pending and say how to approve it.
-        line = ("For safety I can't take a spoken yes for that. Type yes in my "
-                "window, or click Yes on the notification.")
+        # CONFIRMATIONS), and neither can one from Telegram. Keep it pending
+        # and say how to approve it.
+        if remote:
+            line = ("For safety that one can only be approved at the PC itself, "
+                    "so I've left it waiting there.")
+        else:
+            line = ("For safety I can't take a spoken yes for that. Type yes in my "
+                    "window, or click Yes on the notification.")
         print("confirm: spoken yes refused for a physical confirmation")
         ui.set_reply(line)
         voice.say(line, background=False)
@@ -712,6 +739,12 @@ def _finish(marks, t_start):
     ui.set_timing(timing)
     devlog.turn("done", detail=timing, seconds=marks["spoken"])
     print("  timing: " + timing)
+    if "remote" not in marks:
+        try:
+            telegram_bot.notify_long_task(marks.get("asked"), marks.get("said"),
+                                          marks["spoken"])
+        except Exception as e:
+            print("couldn't message Telegram ({})".format(e))
 
 
 def _run_turn(text, t_start, marks):
@@ -743,8 +776,17 @@ def _run_turn(text, t_start, marks):
         return
 
     logbook.user(text)
+    marks["asked"] = text
+    remote = marks.get("remote")
     # Long-term facts relevant to these words go into this turn's prompts.
     recall.set_focus(text)
+
+    if remote is None and _UNPAIR_TELEGRAM.match(text.strip()):
+        line = telegram_bot.unpair()
+        ui.set_reply(line)
+        voice.say(line, background=False)
+        _finish(marks, t_start)
+        return
 
     # The get-to-know-me interview owns the next thing said while it runs.
     if onboarding.active():
@@ -761,7 +803,8 @@ def _run_turn(text, t_start, marks):
 
     # A parked question owns the next thing said, whatever it was going to be.
     if confirm.is_pending():
-        if _resolve_confirmation(text, voice, typed=bool(marks.get("typed"))):
+        if _resolve_confirmation(text, voice, typed=bool(marks.get("typed")),
+                                 remote=remote is not None):
             _finish(marks, t_start)
             return
 
@@ -783,7 +826,11 @@ def _run_turn(text, t_start, marks):
         # Suppressed for chat, where the answer is the reply -- speaking "let
         # me think" first means two synthesis requests with a hole between
         # them, and the earcon already said the same thing.
-        if route["mode"] == "chat":
+        #
+        # Also held back on a Telegram turn: nobody is waiting on audio, and
+        # the turn may yet be refused (REMOTE_BLOCKED) -- the safety net below
+        # sends it once that's been checked.
+        if route["mode"] == "chat" or remote is not None:
             return
         marks["reply"] = time.perf_counter() - t_start
         route["spoke"] = True
@@ -804,6 +851,18 @@ def _run_turn(text, t_start, marks):
         return
 
     kinds_here = {a.get("action") for a in actions if isinstance(a, dict)}
+    if remote is not None:
+        blocked = sorted({telegram_bot.REMOTE_BLOCKED[k] for k in kinds_here
+                          if k in telegram_bot.REMOTE_BLOCKED})
+        if blocked:
+            line = ("I can't do that from Telegram: {} only works when you're at "
+                    "the PC.".format(" and ".join(blocked)))
+            print("telegram: refused {}".format(sorted(kinds_here)))
+            ui.set_reply(line)
+            voice.say(line, background=False)
+            remember(text, line)
+            _finish(marks, t_start)
+            return
     if actions and kinds_here == {"understand_screen"}:
         if reply and not route["spoke"]:
             route["spoke"] = True
@@ -1107,6 +1166,31 @@ def handle_typed(text):
     _run_turn(text, t_start, marks)
 
 
+def handle_remote(item):
+    """Telegram turn (listener/telegram_bot.py): the same as a typed one, but
+    the reply goes back to the phone instead of out of the speaker, and
+    REMOTE_BLOCKED actions and physical confirmations are refused."""
+    text = item["text"]
+    print('Telegram: "{}"'.format(text))
+    devlog.wake("telegram", detail="...{}".format(text[-80:]) if len(text) > 80 else text)
+    # Every remote command is visible at the PC.
+    notify.notify("From Telegram", text)
+    if telegram_bot.local_command(item):
+        return
+    t_start = time.perf_counter()
+    marks = {"remote": []}
+    ui.set_state(ui.THINKING)
+    ui.set_heard("(phone) " + text)
+    before = telegram_bot.snapshot_files()
+    try:
+        _run_turn(text, t_start, marks)
+    except Exception:
+        marks["remote"].append("Something went wrong running that.")
+        raise
+    finally:
+        telegram_bot.reply(item, marks["remote"], before)
+
+
 def _guarded_turn(fn, arg):
     """Last net. One bad turn -- a dropped network call, an app that won't
     die -- should cost that turn and nothing more. Before this, any escape
@@ -1312,6 +1396,13 @@ def _follow_up(stream, model, typing):
 
 def _voice_loop(model, stream, typing):
     while True:
+        remote = telegram_bot.poll()
+        if remote:
+            _guarded_turn(handle_remote, remote)
+            _settle(stream, model, typed=True)
+            _banner(typing)
+            continue
+
         # Checked before the blocking read, so a typed line waits at most one
         # chunk -- 1280 frames at 16kHz, i.e. 80ms. Not perceptible, and it
         # keeps the mic read blocking, which is what stops this loop from
@@ -1359,6 +1450,11 @@ def _typed_only_loop():
     much better outcome to keep running with one input instead of none.
     """
     while True:
+        remote = telegram_bot.poll()
+        if remote:
+            _guarded_turn(handle_remote, remote)
+            _settle(None, None, typed=True)
+            continue
         text = console_input.wait(timeout=0.25)
         if not text:
             continue
@@ -1512,6 +1608,10 @@ def main():
     except Exception as e:
         print("couldn't load preferences: {}".format(e))
 
+    # Telegram remote control: one thread that sleeps in a long poll. Off
+    # unless TELEGRAM_BOT_TOKEN is set.
+    telegram_bot.start()
+
     sweep_recordings()  # clear clips orphaned by a crash or force-kill
     _restore_history()  # pick up where the last run left off
 
@@ -1530,6 +1630,7 @@ def main():
                detail="available={} voice={}".format(
                    tts_moonshine.available(), tts_moonshine.VOICE))
 
+    devlog.sys_event("telegram", "INFO", telegram_bot.status())
     ui.set_engine(tts=tts.primary_engine())
     # Second wipe: model loading above prints native chatter (openwakeword,
     # PortAudio) that nothing else can catch. The panel starts on a clean

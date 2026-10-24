@@ -5,7 +5,7 @@ low-end laptop (HP EliteBook 850 G1: 2-core Haswell, no GPU).
 
 ## Planned
 
-1. **Telegram remote control.** Message Jarvis from your phone; it can
+1. **Telegram remote control.** *(Done -- README, "Control from your phone".)* Message Jarvis from your phone; it can
    message you back when a long task finishes. Only a paired account is
    answered, and protected actions still need Ctrl+Enter at the PC. Cost:
    one idle background thread.

@@ -144,3 +144,23 @@ def transcribe(audio):
     if text.lower().strip(" !") in _HALLUCINATIONS and seconds < 4.0:
         return ""
     return text
+
+
+def transcribe_file(data, filename):
+    """Transcribes an audio file as-is (a Telegram voice note is Ogg Opus,
+    which Whisper reads directly -- no local decoding). Raises on failure."""
+    global _cool_until
+    try:
+        result = _get_client().audio.transcriptions.create(
+            file=(filename, data),
+            model=MODEL,
+            language=LANGUAGE,
+            response_format="json",
+            temperature=0.0,
+        )
+    except Exception as e:
+        if "429" in str(e) or "rate limit" in str(e).lower():
+            _cool_until = time.time() + RATE_LIMIT_COOLDOWN
+        raise
+    text = (getattr(result, "text", "") or "").strip()
+    return "" if text.lower().strip(" !") in _HALLUCINATIONS else text

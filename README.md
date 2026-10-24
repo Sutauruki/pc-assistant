@@ -95,6 +95,10 @@ No manual download step.
 | `STT_ENGINE` | `moonshine` keeps hearing offline even when a Groq key is set | optional |
 | `MOONSHINE_COMPRESSION` | Moonshine STT model size (`listener/stt_moonshine.py`); default `medium_streaming` | optional |
 | `FISH_API_KEY` | primary TTS voice, Fish Audio S2.1 Pro (`listener/tts_fish.py`); without it Moonshine speaks | recommended |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot token from @BotFather; turns on phone control (see "Control from your phone") | optional |
+| `TELEGRAM_SPEAK` | `1` also says Telegram replies out loud at the PC (default `0`) | optional |
+| `TELEGRAM_NOTIFY_AFTER` | seconds a PC command must run before the phone is told it's done (default `60`, `0` = never) | optional |
+| `TELEGRAM_ENABLED` | `0` turns Telegram control off even with a token | optional |
 | `FISH_VOICE_ID` | Fish Audio voice model id (`reference_id`); unset uses a calm British Jarvis voice, `default` uses Fish's stock voice (see "Name, voice and wake word") | optional |
 | `FISH_MODEL` | Fish Audio model header; default `s2.1-pro-free` (free tier), `s2.1-pro` for paid | optional |
 | `FISH_VOLUME_DB` | voice loudness boost in dB, applied by Fish (`prosody.volume`); default `3`, range -12 to 12 | optional |
@@ -252,6 +256,34 @@ another, preview it on fish.audio and put its id in `.env` as
 
 `FISH_VOICE_ID=default` goes back to Fish's own stock voice. Cached short
 replies are kept per voice, so switching never plays the old one.
+
+## Control from your phone (Telegram)
+
+Message Jarvis from anywhere: text or voice notes, replies come back as text
+and the PC stays quiet.
+
+1. In Telegram, message **@BotFather**, send `/newbot`, and pick a name and a
+   username ending in "bot".
+2. Put the token it gives you in `.env`: `TELEGRAM_BOT_TOKEN=...`
+3. Restart Jarvis and send your bot any message. A **6-digit code** appears
+   on the PC; send it to the bot. That account is now the only one answered.
+
+From the phone: any command ("open Chrome", "how's my battery", "make a PDF
+about solar panels" -- the file comes back to you), voice notes (needs
+`GROQ_TTS_API_KEY`), `/screenshot`, `send me <file>` (from
+`Documents\Jarvis`), `/speak on|off`, `/status`, `/unpair`. A command you
+start at the PC that runs over a minute messages you when it's done.
+
+**Security.** No open ports: the PC fetches messages over an outgoing
+connection, so nothing can connect in. Only the paired account in a private
+chat gets a reply; pairing needs the code shown on the PC (5 wrong codes lock
+it for 15 minutes), so a leaked token alone controls nothing. From the phone
+you can answer ordinary yes/no questions, but anything that needs approval at
+the PC (banking, password managers) can't be approved, and the computer agent
+and shell commands are refused. Messages older than 2 minutes are dropped,
+every remote command shows a notification on the PC, and screenshots refuse
+private windows and black out password boxes. "Unpair telegram" at the PC
+forgets the account; `TELEGRAM_ENABLED=0` turns it all off.
 
 ## Memory
 
