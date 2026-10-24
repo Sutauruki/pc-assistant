@@ -1484,7 +1484,7 @@ def main():
     # chatter from native code, which goes to the real file descriptors and
     # sails straight past the stdout proxy -- so anything drawn before this
     # point gets written over and leaves a fragment of a panel on screen.
-    # models/hey_novyx.onnx when you've trained it, else the built-in Hey Jarvis.
+    # A custom models/hey_<name>.onnx if there is one, else the built-in Hey Jarvis.
     model = load_wake_word_model()
     # Open the speaker up front so the first reply isn't slow -- at the
     # voice's own rate (FISH_SAMPLE_RATE), so it never has to reopen.

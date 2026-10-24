@@ -149,7 +149,7 @@ _SELF_NAMES = {"", "jarvis", "yourself", "you", "your window", "this window",
 
 def _is_self(target):
     """A window command with no app named, or naming the assistant (any of
-    identity.ALIASES -- "novyx", "novix", the old "jarvis"), is about it.
+    identity.ALIASES -- "jarvis", or a custom name and its mishearings), is about it.
     (restore_window keeps its own meaning for an empty target: "put back
     what you minimised" -- only an explicit self-name counts there.)"""
     name = " ".join(str(target or "").lower().replace("'s", "").split())

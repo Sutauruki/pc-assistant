@@ -15,8 +15,9 @@ audio: no key, no network, rate limited, or the free window has closed.
 CONFIG (.env)
 -------------
 FISH_API_KEY    required to enable this voice (fish.audio/app/api-keys)
-FISH_VOICE_ID   optional voice model id (`reference_id`) from fish.audio;
-                unset uses Fish's default voice
+FISH_VOICE_ID   voice model id (`reference_id`) from fish.audio. Default:
+                a calm British "Jarvis" voice (DEFAULT_VOICE_ID below);
+                "default" uses Fish's own stock voice instead
 FISH_MODEL      optional model header; default s2.1-pro-free
 FISH_LATENCY    low | normal | balanced (default balanced); low starts
                 talking sooner at a slight cost in voice quality
@@ -50,7 +51,12 @@ from listener.audio_out import StreamingPlayer
 
 API_URL = "https://api.fish.audio/v1/tts"
 API_KEY = os.getenv("FISH_API_KEY", "").strip()
-VOICE_ID = os.getenv("FISH_VOICE_ID", "").strip()
+# fish.audio/m/14129c3e320149449d6bada6862f7338 -- the most-used English
+# "Jarvis" voice on Fish: calm, British, a little dry.
+DEFAULT_VOICE_ID = "14129c3e320149449d6bada6862f7338"
+VOICE_ID = os.getenv("FISH_VOICE_ID", "").strip() or DEFAULT_VOICE_ID
+if VOICE_ID.lower() in ("default", "none", "fish"):
+    VOICE_ID = ""  # Fish's stock voice
 MODEL = os.getenv("FISH_MODEL", "s2.1-pro-free").strip() or "s2.1-pro-free"
 
 _LATENCIES = ("low", "normal", "balanced")

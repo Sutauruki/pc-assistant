@@ -19,10 +19,8 @@ silence needs no inference.
 WHICH WAKE WORD
 ---------------
 A custom model wins when there is one: WAKE_WORD_MODEL (a path), or else
-models/hey_<name>.onnx for the assistant's name (commands/identity.py) --
-models/hey_novyx.onnx for Novyx. Train it free with openWakeWord's notebook
-(see the README, "Custom wake word"). Without one, the built-in "Hey Jarvis"
-model is used and the UI says so.
+models/hey_<name>.onnx for the assistant's name (commands/identity.py).
+Without one -- the normal case -- the built-in "Hey Jarvis" model is used.
 
 Tuning via environment:
   WAKE_THRESHOLD  score needed to trigger (default 0.40)

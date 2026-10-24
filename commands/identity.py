@@ -2,21 +2,18 @@
 
 Goes in: commands/identity.py   (new file)
 
-    ASSISTANT_NAME=Novyx      (.env; default Novyx)
+    ASSISTANT_NAME=Jarvis     (.env; default Jarvis)
 
 The name is used wherever the assistant talks about itself -- its prompts,
 the window, the terminal panel, notifications -- and to recognise "minimize
-Novyx" as being about its own window. Speech-to-text doesn't know a made-up
-word, so ALIASES lists the ways it tends to come out ("Novix", "Nova X").
+Jarvis" as being about its own window. Speech-to-text doesn't know a made-up
+word, so for one of those ALIASES lists the ways it tends to come out.
 
 The wake phrase depends on which wake-word model is loaded
-(listener/wake_word.py): "Hey Novyx" once models/hey_novyx.onnx exists,
-"Hey Jarvis" (the built-in model) until then. wake_phrase() always says the
-one that actually works, so the window never tells you to say something that
-won't wake it.
-
-Folder names (Documents\\Jarvis) and JARVIS_* settings keep their names --
-renaming them would split your existing files and settings.
+(listener/wake_word.py): the built-in "Hey Jarvis", unless a custom
+models/hey_<name>.onnx exists. wake_phrase() always says the one that
+actually works, so the window never tells you to say something that won't
+wake it.
 """
 
 import os
@@ -27,7 +24,7 @@ try:
 except Exception:  # pragma: no cover
     pass
 
-NAME = (os.getenv("ASSISTANT_NAME") or "Novyx").strip() or "Novyx"
+NAME = (os.getenv("ASSISTANT_NAME") or "Jarvis").strip() or "Jarvis"
 
 # How speech-to-text tends to spell a name it has never seen.
 _MISHEARINGS = {

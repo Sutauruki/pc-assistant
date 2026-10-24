@@ -95,7 +95,7 @@ No manual download step.
 | `STT_ENGINE` | `moonshine` keeps hearing offline even when a Groq key is set | optional |
 | `MOONSHINE_COMPRESSION` | Moonshine STT model size (`listener/stt_moonshine.py`); default `medium_streaming` | optional |
 | `FISH_API_KEY` | primary TTS voice, Fish Audio S2.1 Pro (`listener/tts_fish.py`); without it Moonshine speaks | recommended |
-| `FISH_VOICE_ID` | Fish Audio voice model id (`reference_id`); unset uses Fish's default voice | optional |
+| `FISH_VOICE_ID` | Fish Audio voice model id (`reference_id`); unset uses a calm British Jarvis voice, `default` uses Fish's stock voice (see "Name, voice and wake word") | optional |
 | `FISH_MODEL` | Fish Audio model header; default `s2.1-pro-free` (free tier), `s2.1-pro` for paid | optional |
 | `FISH_VOLUME_DB` | voice loudness boost in dB, applied by Fish (`prosody.volume`); default `3`, range -12 to 12 | optional |
 | `FISH_SAMPLE_RATE` | Fish audio sample rate: `44100` (default, Fish's native rate, nothing downsampled), `32000`, `24000`, `16000`, `8000`; the speaker opens at this rate so it never switches mid-reply | optional |
@@ -232,27 +232,26 @@ anything stricter use a paid Gemini key, whose data isn't used that way.
 Windows accessibility on demand; if it doesn't on your machine, start Chrome
 with `--force-renderer-accessibility` (add it to the shortcut's Target).
 
-## Name and custom wake word
+## Name, voice and wake word
 
-The assistant is called **Novyx** (`ASSISTANT_NAME` in `.env`): that's how it
-introduces itself, the name in the window and notifications, and what "minimize
-Novyx" refers to. Your files stay in `Documents\Jarvis` and the `JARVIS_*`
-settings keep their names.
+The assistant is **Jarvis**, woken by **"Hey Jarvis"** (openWakeWord's
+built-in model). Tune waking with `WAKE_THRESHOLD` (default 0.40; higher =
+fewer false wakes, lower = wakes more easily).
 
-**"Hey Novyx" wake word** — train it yourself, free (Google Colab, no
-recordings needed, under an hour):
+**Voice** — by default Fish speaks with a calm British "Jarvis" voice
+([preview](https://fish.audio/m/14129c3e320149449d6bada6862f7338)). To try
+another, preview it on fish.audio and put its id in `.env` as
+`FISH_VOICE_ID=<id>`:
 
-1. Open openWakeWord's training notebook:
-   https://colab.research.google.com/drive/1q1oe2zOyZp7UsB3jJiQ1IFn8z5YfjwEb
-2. Set the wake word to `hey novyx` (if the sample clips mispronounce it, try
-   a phonetic spelling such as `hey no vix`).
-3. Runtime → Run all, wait, then download the `.onnx` model it produces.
-4. Rename it `hey_novyx.onnx` and put it in `pc-assistant\models\`.
-5. Restart. The log says `Loading wake word model hey_novyx.onnx...`.
+| Voice | Id |
+|---|---|
+| JARVIS — sophisticated, subtly witty | `88b183bfbdda44a09ad4474712b967f4` |
+| JARVIS — refined, measured | `41f0953d7a6b4c078445c7e65d620eeb` |
+| Jarvis (MCU) | `05b36da8574341d0803391491850db20` |
+| Brian — British, authoritative but gentle | `65c0b8155c464a648161af8877404f11` |
 
-Until the file exists, the built-in **"Hey Jarvis"** still wakes it, and the
-window tells you which phrase is live. Tune with `WAKE_THRESHOLD` (default
-0.40; higher = fewer false wakes, lower = wakes more easily).
+`FISH_VOICE_ID=default` goes back to Fish's own stock voice. Cached short
+replies are kept per voice, so switching never plays the old one.
 
 ## Memory
 
