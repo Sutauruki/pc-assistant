@@ -79,6 +79,7 @@ from commands import memory
 from commands import notify
 from commands import onboarding
 from commands import recall
+from commands import system_info
 from commands.parser import parse_command, generate_reply, remember
 from commands.executor import execute_actions
 
@@ -668,6 +669,10 @@ def _chat_context(text, actions, results):
         if kind == "run_command":
             output = cmd_control.last_output()
             lines.append(output if output else str(result))
+        elif kind in ("system_info", "system_status", "check_ram", "memory_usage"):
+            # The one-line summary only answers the plain question; a specific
+            # one ("smallest RAM user") needs every app's numbers.
+            lines.append(system_info.details(action.get("what") or action.get("target")))
         else:
             lines.append(str(result))
 
@@ -870,7 +875,11 @@ def _run_turn(text, t_start, marks):
             voice.say(reply)
         _screen_turn(text, actions, t_start, marks, voice)
         return
-    if mode == "both" and actions and kinds_here <= DIRECT_ANSWERS:
+    if "system_info" in kinds_here and not system_info.is_simple(text):
+        # "What's the smallest user of my RAM?" -- the canned sentence can't
+        # answer that, so the chat model answers from the full numbers.
+        mode = "both"
+    elif mode == "both" and actions and kinds_here <= DIRECT_ANSWERS:
         mode = "command"  # the results are the answer; speak them as-is
     if kinds_here & {"computer_task", "browser_run"}:
         _agent_hooks(voice)
