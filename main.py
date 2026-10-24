@@ -154,6 +154,7 @@ SPOKEN_RESULTS = {
     # set_profile is not here: its "I'll remember your name" would repeat
     # the router's own "Got it." -- the reply already covers it.
     "computer_task", "research_explain", "system_info", "get_to_know_me",
+    "my_style",
 }
 
 # Actions whose result is already a finished spoken answer. In mode "both"
@@ -167,7 +168,7 @@ SHOWN_RESULTS = {"list_files", "find_file", "list_windows", "read_clipboard",
 _SHOW_ME = re.compile(r"\b(show me|show it|display|on (the |your )?(screen|window))\b", re.I)
 
 DIRECT_ANSWERS = {"computer_task", "browser_run", "research_explain",
-                  "research_save", "understand_screen", "system_info"}
+                  "research_save", "understand_screen", "system_info", "my_style"}
 
 # How many times to re-record for an answer to a pending confirmation before
 # giving up on it. Two is enough for one misheard reply; more than that and

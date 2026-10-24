@@ -21,6 +21,13 @@ low-end laptop (HP EliteBook 850 G1: 2-core Haswell, no GPU).
    reachable, mic level, disk space, which speech engines are live. Runs
    only on request.
 
+6. **Write as me.** Draft WhatsApp replies and emails in your own voice,
+   from the learned style note, for you to approve before anything is sent.
+
+## Done
+
+- **Personality and learned style** (README, "Personality").
+
 ## Not planned
 
 Too heavy for this laptop, or not useful here: vector memory (LanceDB),

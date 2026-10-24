@@ -357,6 +357,12 @@ def log_turn(user, jarvis):
                 _trim(path)
         except OSError as e:
             print("recall: couldn't log the turn ({})".format(e))
+    if user:
+        try:
+            from commands import persona
+            persona.note_turn()  # learns how you talk, now and then
+        except Exception as e:
+            print("recall: couldn't note the turn for style ({})".format(e))
 
 
 def _trim(path):

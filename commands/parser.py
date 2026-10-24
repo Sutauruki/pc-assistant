@@ -200,6 +200,7 @@ MEMORY
 - {"action": "set_profile", "field": "name"|"call_me"|"location"|"work"|"about", "value": "<what they said>"}
 - {"action": "get_to_know_me"}
 - {"action": "list_memory"}
+- {"action": "my_style", "do": "show"|"forget"|"learn"}
 
 SHELL
 - {"action": "run_command", "command": "<a Windows command line>"}
@@ -408,6 +409,11 @@ right information, and use remember_this if it will matter again this session.
 Do not record a preference from a one-off instruction: "keep this one short"
 is about this answer, "keep answers short" is a standing rule. If you cannot
 tell, don't record it -- a wrong preference follows them around.
+
+"my_style" is about how you've learned the user talks: "how do you think I
+talk" -> show, "forget my style" / "stop copying how I talk" -> forget,
+"learn how I talk now" -> learn. A standing instruction about your own
+behaviour ("be more formal", "stop using my name") is still set_preference.
 
 "list_memory" is for "what do you remember", "what are my preferences",
 "what have you got saved". "forget_preference" for "forget that", "stop

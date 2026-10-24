@@ -396,6 +396,15 @@ def prompt_block(include_session=True):
     remember" section reads to a model as a section it should fill in, and
     invites invention.
     """
+    # Who Jarvis is and how the user talks (commands/persona.py) -- first,
+    # so the preferences below can override it.
+    try:
+        from commands import persona
+        character = persona.prompt_block()
+    except Exception as e:
+        print("memory: couldn't build the personality ({})".format(e))
+        character = ""
+
     prefs = preferences()
     facts = session_facts() if include_session else []
     # Long-term facts relevant to this turn (commands/recall.py).
@@ -407,9 +416,9 @@ def prompt_block(include_session=True):
         lasting = ""
 
     if not prefs and not facts and not lasting:
-        return ""
+        return character
 
-    lines = []
+    lines = [character, ""] if character else []
     if prefs:
         lines.append("HOW THIS USER LIKES YOU TO BEHAVE")
         lines.append("They told you these directly. Follow them over your own"

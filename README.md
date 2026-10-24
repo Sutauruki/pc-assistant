@@ -257,6 +257,27 @@ another, preview it on fish.audio and put its id in `.env` as
 `FISH_VOICE_ID=default` goes back to Fish's own stock voice. Cached short
 replies are kept per voice, so switching never plays the old one.
 
+## Personality
+
+Jarvis is calm and composed with a dry, understated wit: it answers first,
+skips the filler, and keeps the jokes for relaxed moments (never when
+something failed). It calls you by your name now and then -- whatever you
+told it to call you ("call me Ezekiel") -- and never "sir".
+
+**It learns how you talk.** After your first dozen messages, and every 30
+after that, one small model call reads what you've said to it lately and
+writes a short note on your style: message length, slang you actually use,
+energy, how much detail you want. Jarvis drifts toward that while staying
+itself. It's built only from what you say to Jarvis (anything that looks
+like a password or card number is skipped) and kept in `data/style.json`.
+
+- "How do you think I talk?" -- hear the note
+- "Learn how I talk now" -- update it straight away
+- "Forget my style" -- wipe it and start fresh
+
+Direct instructions ("keep it shorter", "stop using my name") are saved as
+preferences and always override the personality.
+
 ## Control from your phone (Telegram)
 
 Message Jarvis from anywhere: text or voice notes, replies come back as text

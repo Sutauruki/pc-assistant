@@ -364,6 +364,9 @@ def _run_one(action):
         )
     if kind in ("list_memory", "what_do_you_remember", "show_memory"):
         return _call(memory.describe)
+    if kind in ("my_style", "how_i_talk"):
+        from commands import persona
+        return _call(persona.handle, _first(action, "do", "mode", default="show"))
 
     # --- shell --------------------------------------------------------------
     if kind == "run_command":
