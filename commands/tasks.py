@@ -39,6 +39,7 @@ against the deny list every time it runs, in case the file was edited.
 
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -314,9 +315,27 @@ def status():
         task = _current
     if task is None:
         return "No task is running."
-    return "Still running: {} -- step {} of {}, {}, for {} so far.".format(
+    line = "Still running: {} -- step {} of {}, {}, for {} so far.".format(
         task["what"], task["step"] + 1, len(task["commands"]),
         task["commands"][task["step"]], _minutes(time.time() - task["started"]))
+    last = _last_line(task["log"])
+    return line + (" Last line: {}".format(last) if last else "")
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _last_line(path):
+    """The newest meaningful line of output so far, scrubbed and short, or
+    "". Progress bars redraw with \\r, so only the last redraw counts."""
+    from commands import app_watch
+    for raw in reversed(_tail(path, 4000).splitlines()):
+        text = _ANSI.sub("", raw.split("\r")[-1]).strip()
+        if not text or text.startswith("$ ") or text.startswith("(exit code"):
+            continue
+        text = app_watch.scrub(text)
+        return text if len(text) <= 150 else text[:147] + "..."
+    return ""
 
 
 def cancel():
