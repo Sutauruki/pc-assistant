@@ -155,6 +155,8 @@ SPOKEN_RESULTS = {
     # the router's own "Got it." -- the reply already covers it.
     "computer_task", "research_explain", "system_info", "get_to_know_me",
     "my_style", "app_status", "watch_app", "stop_watching",
+    "command_task", "task_status", "cancel_task", "save_recipe", "run_recipe",
+    "list_recipes", "delete_recipe",
 }
 
 # Actions whose result is already a finished spoken answer. In mode "both"
@@ -169,7 +171,9 @@ _SHOW_ME = re.compile(r"\b(show me|show it|display|on (the |your )?(screen|windo
 
 DIRECT_ANSWERS = {"computer_task", "browser_run", "research_explain",
                   "research_save", "understand_screen", "system_info", "my_style",
-                  "app_status", "watch_app", "stop_watching"}
+                  "app_status", "watch_app", "stop_watching",
+                  "command_task", "task_status", "cancel_task", "save_recipe",
+                  "run_recipe", "list_recipes", "delete_recipe"}
 
 # How many times to re-record for an answer to a pending confirmation before
 # giving up on it. Two is enough for one misheard reply; more than that and
@@ -550,8 +554,11 @@ def _resolve_confirmation(text, voice, typed=False, remote=False):
         # CONFIRMATIONS), and neither can one from Telegram. Keep it pending
         # and say how to approve it.
         if remote:
+            # Only reached without JARVIS_REMOTE_PIN: with one, handle_remote
+            # takes the reply as a PIN attempt before it gets here.
             line = ("For safety that one can only be approved at the PC itself, "
-                    "so I've left it waiting there.")
+                    "so I've left it waiting there. Set JARVIS_REMOTE_PIN on the PC "
+                    "to approve things like this from your phone.")
         else:
             line = ("For safety I can't take a spoken yes for that. Type yes in my "
                     "window, or click Yes on the notification.")
@@ -859,17 +866,38 @@ def _run_turn(text, t_start, marks):
 
     kinds_here = {a.get("action") for a in actions if isinstance(a, dict)}
     if remote is not None:
-        blocked = sorted({telegram_bot.REMOTE_BLOCKED[k] for k in kinds_here
-                          if k in telegram_bot.REMOTE_BLOCKED})
+        blocked = {telegram_bot.REMOTE_BLOCKED[k] for k in kinds_here
+                   if k in telegram_bot.REMOTE_BLOCKED}
+        blocked |= {telegram_bot.REMOTE_PC_ONLY[k] for k in kinds_here
+                    if k in telegram_bot.REMOTE_PC_ONLY}
+        needs_pin = {telegram_bot.REMOTE_NEEDS_PIN[k] for k in kinds_here
+                     if k in telegram_bot.REMOTE_NEEDS_PIN}
+        line = None
         if blocked:
             line = ("I can't do that from Telegram: {} only works when you're at "
-                    "the PC.".format(" and ".join(blocked)))
+                    "the PC.".format(" and ".join(sorted(blocked))))
+        elif needs_pin and not telegram_bot.pin_enabled():
+            line = ("I can't do that from Telegram yet: {} from your phone needs a "
+                    "PIN. Set JARVIS_REMOTE_PIN in .env on the PC and restart me.".format(
+                        " and ".join(sorted(needs_pin))))
+        if line:
             print("telegram: refused {}".format(sorted(kinds_here)))
             ui.set_reply(line)
             voice.say(line, background=False)
             remember(text, line)
             _finish(marks, t_start)
             return
+        # From the phone, every command waits for the PIN -- read-only ones
+        # too. A single run_command becomes a one-step background task so it
+        # can be approved the same way and report back when it ends.
+        for i, action in enumerate(actions):
+            if not isinstance(action, dict):
+                continue
+            if action.get("action") == "run_command":
+                actions[i] = {"action": "command_task", "folder": action.get("cwd") or "",
+                              "commands": [action.get("command") or action.get("cmd") or ""]}
+            if actions[i].get("action") in ("command_task", "run_recipe"):
+                actions[i]["require_approval"] = True
     if actions and kinds_here == {"understand_screen"}:
         if reply and not route["spoke"]:
             route["spoke"] = True
@@ -1177,10 +1205,54 @@ def handle_typed(text):
     _run_turn(text, t_start, marks)
 
 
+def _remote_approval(item, verdict):
+    """A reply to a question waiting for the PIN (telegram_bot.pin_attempt).
+    Nothing here prints, logs or routes the message itself -- it may be the
+    PIN."""
+    chat_id = item["chat_id"]
+    say = lambda line: telegram_bot.send_to(chat_id, line)
+    if verdict == "no":
+        say(confirm.reject() or "Nothing was waiting.")
+    elif verdict == "yes":
+        confirm.extend(telegram_bot.PIN_APPROVAL_SECONDS)
+        say("Send your PIN to approve it -- as its own message. Or no to cancel.")
+    elif verdict == "voice":
+        say("Type your PIN instead -- don't say it out loud.")
+    elif verdict == "ok":
+        label = (confirm.pending() or {}).get("label", "a request")
+        notify.notify("Approved from Telegram", "With your PIN: {}".format(label))
+        print("telegram: approved with the PIN -- {}".format(label))
+        comtypes.CoInitialize()
+        try:
+            result = confirm.accept()
+        finally:
+            comtypes.CoUninitialize()
+        say(result or "That request had expired -- ask again.")
+        if result:
+            logbook.jarvis(result)
+    elif verdict.startswith("wrong:"):
+        left = verdict.split(":", 1)[1]
+        confirm.extend(telegram_bot.PIN_APPROVAL_SECONDS)
+        say("Wrong PIN. {} tr{} left.".format(left, "y" if left == "1" else "ies"))
+    elif verdict in ("locked", "locked_now"):
+        confirm.clear()
+        say("Too many wrong PINs. Approvals from the phone are locked for 30 minutes.")
+    elif verdict == "unpaired":
+        confirm.clear()
+        say("Too many wrong PINs. Telegram is unpaired -- pair again from the PC.")
+
+
 def handle_remote(item):
     """Telegram turn (listener/telegram_bot.py): the same as a typed one, but
-    the reply goes back to the phone instead of out of the speaker, and
-    REMOTE_BLOCKED actions and physical confirmations are refused."""
+    the reply goes back to the phone instead of out of the speaker. Blocked
+    actions are refused; commands and physical confirmations need the PIN."""
+    # First, before anything is printed or logged: is this the answer to a
+    # question waiting for the PIN?
+    if confirm.is_pending() and confirm.needs_physical() and telegram_bot.pin_enabled():
+        verdict = telegram_bot.pin_attempt(item)
+        if verdict is not None:
+            _remote_approval(item, verdict)
+            return
     text = item["text"]
     print('Telegram: "{}"'.format(text))
     devlog.wake("telegram", detail="...{}".format(text[-80:]) if len(text) > 80 else text)

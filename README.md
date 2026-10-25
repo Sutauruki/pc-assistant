@@ -98,6 +98,7 @@ No manual download step.
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token from @BotFather; turns on phone control (see "Control from your phone") | optional |
 | `TELEGRAM_SPEAK` | `1` also says Telegram replies out loud at the PC (default `0`) | optional |
 | `TELEGRAM_NOTIFY_AFTER` | seconds a PC command must run before the phone is told it's done (default `60`, `0` = never) | optional |
+| `JARVIS_REMOTE_PIN` | lets Telegram approve commands, recipes and anything that needs a yes at the PC (6+ characters with a digit); unset = never from the phone | optional |
 | `TELEGRAM_ENABLED` | `0` turns Telegram control off even with a token | optional |
 | `FISH_VOICE_ID` | Fish Audio voice model id (`reference_id`); unset uses a calm British Jarvis voice, `default` uses Fish's stock voice (see "Name, voice and wake word") | optional |
 | `FISH_MODEL` | Fish Audio model header; default `s2.1-pro-free` (free tier), `s2.1-pro` for paid | optional |
@@ -257,6 +258,33 @@ another, preview it on fish.audio and put its id in `.env` as
 `FISH_VOICE_ID=default` goes back to Fish's own stock voice. Cached short
 replies are kept per voice, so switching never plays the old one.
 
+## Running commands in the background
+
+*"In pc-assistant, git pull then pip install -r requirements.txt, and tell me
+when it's done."* Jarvis finds the folder by name, reads the plan back once
+("In pc-assistant: git pull, then pip install... Should I?"), and after your
+yes runs it in the background with no time limit. Each command runs only if
+the one before it worked; when it ends you get a notification and a Telegram
+message saying what happened (or the error line). The full output is in
+`Documents\Jarvis\Logs` -- "send me the task log" from Telegram.
+
+- "Is the task done?" / "Cancel the task"
+- **Recipes:** "save that as update jarvis" (at the PC), then "run update
+  jarvis" any time. At the PC a recipe runs straight away -- you approved
+  those exact commands when you saved it. From the phone it needs your PIN.
+
+Every command is checked against the deny list first (format, diskpart,
+mass deletes...), recipes included, every time they run.
+
+**From your phone, with a PIN.** Set `JARVIS_REMOTE_PIN` in `.env` (6+
+characters with a digit, not something like 123456). Then commands, recipes
+and anything else that needs a yes at the PC can be approved from Telegram:
+Jarvis asks, you send the PIN as its own message, and it deletes that
+message from the chat so nobody can scroll back to it. The PIN never reaches
+a model or a log. 3 wrong PINs lock phone approvals for 30 minutes; 3 more
+unpair Telegram. Without a PIN, none of this works from the phone at all.
+The computer agent (mouse and keyboard) is never available from the phone.
+
 ## Checking on your apps
 
 Ask about one app and Jarvis looks at **that window alone** -- even behind
@@ -322,9 +350,10 @@ start at the PC that runs over a minute messages you when it's done.
 connection, so nothing can connect in. Only the paired account in a private
 chat gets a reply; pairing needs the code shown on the PC (5 wrong codes lock
 it for 15 minutes), so a leaked token alone controls nothing. From the phone
-you can answer ordinary yes/no questions, but anything that needs approval at
-the PC (banking, password managers) can't be approved, and the computer agent
-and shell commands are refused. Messages older than 2 minutes are dropped,
+you can answer ordinary yes/no questions; anything that needs approval at the
+PC -- commands, recipes, protected apps -- needs your `JARVIS_REMOTE_PIN`
+(see "Running commands in the background"), and the computer agent is
+refused. Messages older than 2 minutes are dropped,
 every remote command shows a notification on the PC, and screenshots refuse
 private windows and black out password boxes. "Unpair telegram" at the PC
 forgets the account; `TELEGRAM_ENABLED=0` turns it all off.

@@ -81,7 +81,7 @@ def _live():
     global _pending
     if _pending is None:
         return None
-    if time.time() - _pending["created"] > EXPIRY_SECONDS:
+    if time.time() - _pending["created"] > _pending.get("expiry", EXPIRY_SECONDS):
         stale, _pending = _pending, None
         print("confirm: request expired ({})".format(stale["label"]))
         return None
@@ -114,6 +114,15 @@ def set_context(text, kinds=()):
         if entry is not None:
             entry["asked"] = str(text or "")
             entry["kinds"] = [k for k in kinds if k]
+
+
+def extend(seconds):
+    """Gives the pending question `seconds` from now -- typing a PIN on a
+    phone takes longer than saying yes."""
+    with _lock:
+        entry = _live()
+        if entry is not None:
+            entry["expiry"] = (time.time() - entry["created"]) + float(seconds)
 
 
 def needs_physical():

@@ -63,17 +63,36 @@ ENABLED = (os.getenv("TELEGRAM_ENABLED", "1").strip().lower()
            not in ("0", "false", "no", "off"))
 SPEAK = (os.getenv("TELEGRAM_SPEAK", "0").strip().lower()
          in ("1", "true", "yes", "on"))
+# Approving from the phone what would otherwise need a physical yes at the
+# PC (shell commands, recipes, protected apps). Unset or weak: nothing that
+# needs the PC can be approved from the phone.
+REMOTE_PIN = (os.getenv("JARVIS_REMOTE_PIN") or "").strip()
+PIN_TRIES = 3                # wrong PINs before approvals lock
+PIN_LOCK_SECONDS = 1800      # locked this long; a second lockout unpairs
+PIN_APPROVAL_SECONDS = 120   # how long a question waits for the PIN
 try:
     NOTIFY_AFTER = float(os.getenv("TELEGRAM_NOTIFY_AFTER", "60").strip() or 60)
 except ValueError:
     NOTIFY_AFTER = 60.0
 
-# Actions a remote message may never start. The agent clicks and types with
-# nobody watching the screen; a shell command can do anything at all.
+# Actions a remote message may never start: the agent clicks and types with
+# nobody watching the screen, and asks for Ctrl+Enter mid-task.
 REMOTE_BLOCKED = {
     "computer_task": "taking over the mouse and keyboard",
     "browser_run": "taking over the mouse and keyboard",
-    "run_command": "running shell commands",
+}
+# Allowed from the phone only with JARVIS_REMOTE_PIN set -- and then every
+# one of them waits for the PIN, read-only or not.
+REMOTE_NEEDS_PIN = {
+    "run_command": "running commands",
+    "command_task": "running commands",
+    "run_recipe": "running recipes",
+}
+# Never from the phone: a recipe saved remotely would be a way to run
+# anything later.
+REMOTE_PC_ONLY = {
+    "save_recipe": "saving recipes",
+    "delete_recipe": "deleting recipes",
 }
 
 API = "https://api.telegram.org"
@@ -103,6 +122,7 @@ _speak = SPEAK
 _session = None
 _stop = threading.Event()
 _warned = set()
+_pin = {"fails": 0, "locked_until": 0.0, "lockouts": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +357,8 @@ def _handle_update(update):
     if not text:
         _send(chat["id"], "I can read text and voice notes.")
         return
-    _inbox.put({"chat_id": chat["id"], "text": text[:2000]})
+    _inbox.put({"chat_id": chat["id"], "text": text[:2000],
+                "message_id": msg.get("message_id"), "voice": bool(voice)})
 
 
 def _transcribe_voice(chat_id, voice):
@@ -491,6 +512,9 @@ def stop():
 def start():
     """Starts the background poller. Returns False when not configured."""
     global _thread, _status
+    if REMOTE_PIN and _pin_problem(REMOTE_PIN):
+        print("telegram: JARVIS_REMOTE_PIN is ignored -- {}. Phone approvals stay "
+              "off.".format(_pin_problem(REMOTE_PIN)))
     if not ENABLED:
         _status = "off (TELEGRAM_ENABLED=0)"
         return False
@@ -519,6 +543,97 @@ def poll():
 
 
 # ---------------------------------------------------------------------------
+# Remote PIN (approving from the phone)
+# ---------------------------------------------------------------------------
+
+_WEAK = {"123456", "1234567", "12345678", "123456789", "654321", "123123",
+         "121212", "112233", "password", "password1", "qwerty", "abc123",
+         "000000", "111111", "696969", "999999", "jarvis", "jarvis1"}
+
+
+def _pin_problem(pin):
+    """Why `pin` is too weak to use, or None."""
+    if len(pin) < 6:
+        return "it needs at least 6 characters"
+    if not any(c.isdigit() for c in pin):
+        return "it needs at least one digit"
+    if any(c.isspace() for c in pin):
+        return "it can't contain spaces"
+    if pin.lower() in _WEAK or len(set(pin)) == 1:
+        return "it's too easy to guess"
+    if pin.isdigit():
+        steps = {int(b) - int(a) for a, b in zip(pin, pin[1:])}
+        if steps in ({1}, {-1}):
+            return "it's too easy to guess"
+    return None
+
+
+def pin_enabled():
+    return bool(REMOTE_PIN) and _pin_problem(REMOTE_PIN) is None
+
+
+def send_to(chat_id, text):
+    _send(chat_id, text)
+
+
+def _delete(item):
+    """Removes the PIN message from the chat, so it can't be scrolled back to."""
+    if item.get("message_id"):
+        try:
+            _call("deleteMessage", chat_id=item["chat_id"], message_id=item["message_id"])
+        except Exception as e:
+            print("telegram: couldn't delete the PIN message ({})".format(_scrub(e)))
+
+
+def pin_attempt(item):
+    """Reads a reply to a question that needs the PIN. Returns None when the
+    message isn't an answer at all (it then runs as a normal command), or one
+    of: "no", "yes" (asks for the PIN instead), "voice" (PINs are typed),
+    "ok", "wrong:<tries left>", "locked", "locked_now", "unpaired".
+
+    A PIN-shaped message -- one word with a digit in it -- is deleted from the
+    chat whether it's right or wrong, and is never printed, logged or sent to
+    a model."""
+    import hmac
+    from commands import confirm
+    text = (item.get("text") or "").strip()
+    verdict = confirm.interpret(text)
+    if verdict is False:
+        return "no"
+    if verdict is True:
+        return "yes"
+    if not re.fullmatch(r"\S{4,64}", text) or not any(c.isdigit() for c in text):
+        return None
+    if item.get("voice"):
+        return "voice"
+    _delete(item)
+    now = time.time()
+    with _lock:
+        if now < _pin["locked_until"]:
+            return "locked"
+        if hmac.compare_digest(text.encode("utf-8"), REMOTE_PIN.encode("utf-8")):
+            _pin.update(fails=0, lockouts=0)
+            return "ok"
+        _pin["fails"] += 1
+        if _pin["fails"] < PIN_TRIES:
+            return "wrong:{}".format(PIN_TRIES - _pin["fails"])
+        _pin["fails"] = 0
+        _pin["lockouts"] += 1
+        lockouts = _pin["lockouts"]
+        if lockouts < 2:
+            _pin["locked_until"] = now + PIN_LOCK_SECONDS
+    if lockouts >= 2:
+        unpair()
+        _pin.update(lockouts=0, locked_until=0.0)
+        _show_on_pc("Telegram", "Too many wrong PINs from the phone -- Telegram has been "
+                    "unpaired. Pair again from the PC if that was you.")
+        return "unpaired"
+    _show_on_pc("Telegram", "3 wrong PINs from the phone -- approvals from Telegram are "
+                "locked for 30 minutes.")
+    return "locked_now"
+
+
+# ---------------------------------------------------------------------------
 # Remote turns (called by main.py on its own thread)
 # ---------------------------------------------------------------------------
 
@@ -536,8 +651,10 @@ _HELP = (
     "/speak on|off -- also say replies out loud at the PC\n"
     "/status -- is the PC OK\n"
     "/unpair -- forget this account\n\n"
-    "Not from here: taking over the mouse and keyboard, shell commands, and "
-    "anything that needs approval at the PC."
+    "Commands, recipes (\"run update jarvis\") and anything that needs approval "
+    "at the PC ask for your PIN (JARVIS_REMOTE_PIN) -- send it as its own "
+    "message; I delete it from the chat. Never from here: taking over the "
+    "mouse and keyboard."
 )
 
 _SCREENSHOT = re.compile(
@@ -706,12 +823,18 @@ def reply(item, lines, before):
     try:
         from commands import confirm
         if confirm.is_pending() and confirm.needs_physical():
-            text += " (That one needs approval at the PC itself.)"
+            if pin_enabled():
+                confirm.extend(PIN_APPROVAL_SECONDS)
+                text += " Reply with your PIN to approve, or no to cancel."
+            else:
+                text += (" That needs approval at the PC itself (set JARVIS_REMOTE_PIN "
+                         "there to approve things like this from your phone).")
     except Exception:
         pass
     _send(chat_id, text or "Done.")
     new = [p for p, m in snapshot_files().items()
-           if (p not in before or m > before[p]) and "Screenshots" not in p.parts]
+           if (p not in before or m > before[p])
+           and "Screenshots" not in p.parts and "Logs" not in p.parts]
     for path in sorted(new, key=lambda p: p.stat().st_mtime)[:MAX_FILES_PER_TURN]:
         _send_file(chat_id, path)
 

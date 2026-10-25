@@ -364,6 +364,31 @@ def _run_one(action):
         )
     if kind in ("list_memory", "what_do_you_remember", "show_memory"):
         return _call(memory.describe)
+    # --- background command tasks and recipes (commands/tasks.py) ----------
+    if kind in ("command_task", "run_commands", "shell_task"):
+        from commands import tasks
+        commands = action.get("commands") or action.get("command") or []
+        return _call(tasks.plan, _first(action, "folder", "cwd", "where", default=""),
+                     commands, None, bool(action.get("require_approval")))
+    if kind == "task_status":
+        from commands import tasks
+        return _call(tasks.status)
+    if kind == "cancel_task":
+        from commands import tasks
+        return _call(tasks.cancel)
+    if kind == "save_recipe":
+        from commands import tasks
+        return _call(tasks.save_recipe, _first(action, "name", "target", default=""))
+    if kind == "run_recipe":
+        from commands import tasks
+        return _call(tasks.run_recipe, _first(action, "name", "target", default=""),
+                     bool(action.get("require_approval")))
+    if kind == "list_recipes":
+        from commands import tasks
+        return _call(tasks.list_recipes)
+    if kind == "delete_recipe":
+        from commands import tasks
+        return _call(tasks.delete_recipe, _first(action, "name", "target", default=""))
     if kind in ("app_status", "check_app", "is_app_done"):
         from commands import app_watch
         return _call(app_watch.status, _first(action, "target", "app", "name", default=""),
