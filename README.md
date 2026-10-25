@@ -257,6 +257,29 @@ another, preview it on fish.audio and put its id in `.env` as
 `FISH_VOICE_ID=default` goes back to Fish's own stock voice. Cached short
 replies are kept per voice, so switching never plays the old one.
 
+## Checking on your apps
+
+Ask about one app and Jarvis looks at **that window alone** -- even behind
+other windows, even minimized -- reads its text (terminals included), and
+tells you what's going on:
+
+- "Is Claude done?" / "What's Claude doing rn?"
+- "What's happening in my terminal?" / "Is the build in VS Code finished?"
+- "Tell me when Claude is done" -- it watches and pings you (notification,
+  plus Telegram if paired) when it finishes, **needs your approval**, errors
+  or the window closes. "Stop watching" ends it.
+- From Telegram, "show me Claude" sends a picture of just that window.
+
+The watcher is light: every 30 seconds it compares a tiny thumbnail of the
+window on the PC (milliseconds, no model call), and asks Gemini only once the
+window has stopped changing -- a long task costs a handful of calls. Up to 3
+apps at once, for up to 4 hours.
+
+Same privacy rules as screen vision: private windows are refused, password
+boxes are blacked out, and text that looks like a key or token is hidden
+before anything is sent. A status answer never sends a picture; only "show
+me <app>" does. Needs `GEMINI_API_KEY`.
+
 ## Personality
 
 Jarvis is calm and composed with a dry, understated wit: it answers first,

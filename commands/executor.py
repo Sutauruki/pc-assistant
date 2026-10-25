@@ -364,6 +364,16 @@ def _run_one(action):
         )
     if kind in ("list_memory", "what_do_you_remember", "show_memory"):
         return _call(memory.describe)
+    if kind in ("app_status", "check_app", "is_app_done"):
+        from commands import app_watch
+        return _call(app_watch.status, _first(action, "target", "app", "name", default=""),
+                     _first(action, "question", "query", "text", default=""))
+    if kind in ("watch_app", "notify_when_done"):
+        from commands import app_watch
+        return _call(app_watch.watch, _first(action, "target", "app", "name", default=""))
+    if kind in ("stop_watching", "unwatch_app"):
+        from commands import app_watch
+        return _call(app_watch.stop, _first(action, "target", "app", "name", default=""))
     if kind in ("my_style", "how_i_talk"):
         from commands import persona
         return _call(persona.handle, _first(action, "do", "mode", default="show"))

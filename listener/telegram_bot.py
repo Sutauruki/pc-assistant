@@ -530,6 +530,8 @@ _HELP = (
     "Send any command you'd say to Jarvis -- \"open Chrome\", \"how's my battery\", "
     "\"make a PDF about solar panels\" -- as text or a voice note.\n\n"
     "/screenshot -- see the screen (private windows are refused)\n"
+    "show me <app> -- a picture of just that app's window\n"
+    "is Claude done? / tell me when Claude is done -- check or watch an app\n"
     "send me <file> -- a file from Documents\\Jarvis\n"
     "/speak on|off -- also say replies out loud at the PC\n"
     "/status -- is the PC OK\n"
@@ -541,6 +543,9 @@ _HELP = (
 _SCREENSHOT = re.compile(
     r"^/screenshot\b|^(please )?(send|show|take|get)( me)?( a| the)? (screenshot|screen ?shot|"
     r"picture of (my |the )?screen)\b", re.I)
+_APP_PICTURE = re.compile(
+    r"^(?:please )?(?:show me|send me (?:a )?(?:picture|screenshot|pic|photo) of|"
+    r"(?:screenshot|picture|pic|photo) of) (?:the |my )?(.+?)(?: window| app)?\s*$", re.I)
 _SEND_FILE = re.compile(r"^(?:please )?send me (?:the |my |that )?(.+?)\s*$", re.I)
 _LATEST = re.compile(r"\b(latest|last|newest|recent|most recent)\b", re.I)
 
@@ -569,6 +574,9 @@ def local_command(item):
         return True
     if _SCREENSHOT.search(text):
         _screenshot(chat_id)
+        return True
+    m = _APP_PICTURE.match(text)
+    if m and _app_picture(chat_id, m.group(1)):
         return True
     m = _SEND_FILE.match(text)
     if m and "screenshot" not in low:
@@ -614,6 +622,28 @@ def _screenshot(chat_id):
     path.write_bytes(jpeg)
     _send_file(chat_id, path, photo=True,
                caption=(window or {}).get("title", "")[:200])
+
+
+def _app_picture(chat_id, target):
+    """"show me Claude": a picture of just that window. False when no window
+    matches, so the words go on to the router ("show me my files")."""
+    import comtypes
+    from commands import app_watch
+    comtypes.CoInitialize()
+    try:
+        if app_watch.find(target) is None:
+            return False
+        path, caption = app_watch.picture(target)
+    except Exception as e:
+        _send(chat_id, "I couldn't capture that ({}).".format(e))
+        return True
+    finally:
+        comtypes.CoUninitialize()
+    if path is None:
+        _send(chat_id, caption)
+    else:
+        _send_file(chat_id, path, photo=True, caption=caption)
+    return True
 
 
 def _jarvis_files():

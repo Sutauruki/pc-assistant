@@ -27,6 +27,7 @@ low-end laptop (HP EliteBook 850 G1: 2-core Haswell, no GPU).
 ## Done
 
 - **Personality and learned style** (README, "Personality").
+- **Checking on apps and the watcher** (README, "Checking on your apps").
 
 ## Not planned
 
