@@ -195,6 +195,30 @@ def snapshot(hwnd, bounds=None, max_items=160, max_text_chars=5000):
         return {"elements": [], "text": ""}
 
 
+def bounded(fn, timeout, default):
+    """fn() on its own thread, giving up after `timeout` seconds.
+
+    UI Automation asks the app itself, and a big or busy one -- VS Code or
+    Chrome with many tabs on a slow laptop -- can take minutes to answer.
+    Without a bound that freezes whoever asked (the main loop, so Telegram
+    stops answering). An abandoned call finishes in the background."""
+    box = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except Exception as e:
+            box["error"] = e
+
+    thread = threading.Thread(target=run, name="uia-bounded", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        print("uia: the window took longer than {}s to answer -- skipped".format(timeout))
+        return default
+    return box.get("value", default)
+
+
 def focused():
     """{"name", "type", "password"} for whatever has keyboard focus, or None."""
     try:

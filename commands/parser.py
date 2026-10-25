@@ -384,6 +384,16 @@ when finished. run_command is only for one quick command with no folder
 the task" -> cancel_task. "save that as update jarvis" -> save_recipe;
 "run update jarvis" (a name they saved, not a command) -> run_recipe;
 "what recipes do I have" -> list_recipes. All mode "command".
+
+A QUESTION ABOUT A COMMAND THAT ALREADY RAN IS NEVER ANSWERED BY RUNNING ONE.
+"how was the npm build I ran", "check the command I ran in ExamSlingDesktop",
+"did my install finish", "what happened with the build" -> app_status with
+target "terminal" (it also looks in VS Code's built-in terminal) and their
+exact words as the question. Never run_command or command_task for these --
+running it again repeats a build nobody asked for -- and never doskey or
+history commands, which can't see another window's commands. Right after
+you started a command_task, "is it done", "how's it going", "is the build
+finished" -> task_status.
 Do not use it to delete, move, copy or rename files -- the file actions use the
 recycle bin and check where they are pointed, and a shell command does neither.
 Do not use it to open or close apps either.
@@ -550,6 +560,9 @@ I'm working in the pc-assistant folder today
 in pc-assistant run git pull then pip install -r requirements.txt and tell me when it's done
 {"mode": "command", "reply": "Setting that up.", "actions": [{"action": "command_task", "folder": "pc-assistant", "commands": ["git pull", "pip install -r requirements.txt"]}]}
 
+how was the npm run build command I ran in ExamSlingDesktop
+{"mode": "command", "reply": "Let me look.", "actions": [{"action": "app_status", "target": "terminal", "question": "how was the npm run build command I ran in ExamSlingDesktop"}]}
+
 is claude done
 {"mode": "command", "reply": "Checking on Claude.", "actions": [{"action": "app_status", "target": "claude", "question": "is Claude done"}]}
 
@@ -654,6 +667,19 @@ def remember(user_text, assistant_text):
             str(assistant_text or "")[:HISTORY_CHARS],
         ))
         del _history[:-ROUTER_HISTORY_TURNS]
+    # The chat brain keeps its own history; without command turns in it,
+    # "what did you do then?" gets answered from older, unrelated talk.
+    try:
+        from commands import chat
+        chat.remember(user_text, assistant_text)
+    except Exception as e:
+        print("parser: couldn't share the turn with chat ({})".format(e))
+
+
+def remember_event(text):
+    """Something that happened in the background (a task finished, a watched
+    app is done), so the next question about it has context."""
+    remember("", "[while you were away] " + str(text or ""))
 
 
 def forget():

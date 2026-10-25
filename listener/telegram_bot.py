@@ -96,7 +96,7 @@ REMOTE_PC_ONLY = {
 }
 
 API = "https://api.telegram.org"
-POLL_SECONDS = 30            # long-poll wait; the thread sleeps in the socket
+POLL_SECONDS = 20            # long-poll wait; the thread sleeps in the socket
 MAX_AGE_SECONDS = 120        # older messages are dropped
 CODE_SECONDS = 600           # a pairing code lives this long
 CODE_TRIES = 5
@@ -123,6 +123,8 @@ _session = None
 _stop = threading.Event()
 _warned = set()
 _pin = {"fails": 0, "locked_until": 0.0, "lockouts": 0}
+_waiting = []            # queued items the main loop hasn't picked up yet
+BUSY_NOTICE_SECONDS = 15
 
 
 # ---------------------------------------------------------------------------
@@ -357,8 +359,11 @@ def _handle_update(update):
     if not text:
         _send(chat["id"], "I can read text and voice notes.")
         return
-    _inbox.put({"chat_id": chat["id"], "text": text[:2000],
-                "message_id": msg.get("message_id"), "voice": bool(voice)})
+    item = {"chat_id": chat["id"], "text": text[:2000], "message_id": msg.get("message_id"),
+            "voice": bool(voice), "queued": time.time(), "told": False}
+    with _lock:
+        _waiting.append(item)
+    _inbox.put(item)
 
 
 def _transcribe_voice(chat_id, voice):
@@ -487,6 +492,7 @@ def _loop():
             _stop.wait(backoff)
             backoff = min(backoff * 2, 60)
             continue
+        _tell_if_busy()
         for update in updates or []:
             offset = update["update_id"] + 1
             try:
@@ -534,10 +540,27 @@ def status():
     return _status
 
 
+def _tell_if_busy():
+    """A message that's been waiting a while gets a "still on the last one"
+    -- silence reads as broken. Once per message."""
+    now = time.time()
+    with _lock:
+        late = [i for i in _waiting if not i["told"] and now - i["queued"] > BUSY_NOTICE_SECONDS]
+        for item in late:
+            item["told"] = True
+    for item in late:
+        _send(item["chat_id"], "Still finishing your last request -- I'll get to this "
+                               "one right after.")
+
+
 def poll():
     """The next remote command for the main loop, or None. Never blocks."""
     try:
-        return _inbox.get_nowait()
+        item = _inbox.get_nowait()
+        with _lock:
+            if item in _waiting:
+                _waiting.remove(item)
+        return item
     except queue.Empty:
         return None
 
@@ -689,11 +712,13 @@ def local_command(item):
     if low == "/status":
         _send(chat_id, _status_text())
         return True
+    # "a screenshot of the terminal" is about one app, so it's tried before
+    # the whole-screen screenshot.
+    m = _APP_PICTURE.match(text.rstrip(" ?.!"))
+    if m and _app_picture(chat_id, m.group(1)):
+        return True
     if _SCREENSHOT.search(text):
         _screenshot(chat_id)
-        return True
-    m = _APP_PICTURE.match(text)
-    if m and _app_picture(chat_id, m.group(1)):
         return True
     m = _SEND_FILE.match(text)
     if m and "screenshot" not in low:

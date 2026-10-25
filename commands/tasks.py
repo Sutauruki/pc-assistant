@@ -147,8 +147,9 @@ def plan(folder_spec, commands, label=None, require_approval=False):
     what = _describe(folder, commands)
     if not needs and not require_approval:
         return _start(folder, commands, label)
-    question = ("{}. Should I? It needs a physical yes: type yes in my window or "
-                "click Yes on the notification.".format(what))
+    # How to approve is added by whoever shows it: the PC's spoken refusal
+    # explains typing yes, Telegram asks for the PIN.
+    question = "{}. Should I?".format(what)
     return confirm.request(question, lambda: _start(folder, commands, label),
                            label="task: " + what, physical=True)
 
@@ -306,6 +307,11 @@ def _announce(line):
     try:
         from listener import telegram_bot
         telegram_bot.send(line)
+    except Exception:
+        pass
+    try:
+        from commands import parser
+        parser.remember_event(line)
     except Exception:
         pass
 

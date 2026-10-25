@@ -194,6 +194,15 @@ CONFIRM_TYPED_SECONDS = 8.0
 
 _FAILURE_WORDS = ("failed", "couldn't", "didn't")
 
+# "the npm command I ran", "the build I started", "how did it go": asking
+# about something already run. Never answered by running a command.
+_ALREADY_RAN = re.compile(
+    r"\b(i|we)( just| already)? (ran|started|kicked off|launched|executed|did)\b"
+    r"|\byou( just| already)? (ran|started|kicked off|launched)\b"
+    r"|\b(how|what) (was|did|is|happened)\b.*\b(command|build|install|script|npm|"
+    r"test|tests|deploy|pull|run)\b(?!.*\bnow\b)", re.I)
+_RUNS_THINGS = {"run_command", "command_task", "run_recipe"}
+
 # Said or typed at the PC: forget the paired Telegram account.
 _UNPAIR_TELEGRAM = re.compile(r"^(unpair|disconnect|unlink|forget) (my |the )?telegram\b", re.I)
 
@@ -864,6 +873,18 @@ def _run_turn(text, t_start, marks):
         _chat_turn(text, t_start, marks, voice)
         return
 
+    if _ALREADY_RAN.search(text) and any(
+            isinstance(a, dict) and a.get("action") in _RUNS_THINGS for a in actions):
+        # "How was the build I ran?" is a question about something already
+        # done. Running it again to find out -- what a model sometimes picks
+        # -- repeats a build or a deploy nobody asked for. Look instead.
+        print("route: '{}' asks about a command already run -- checking, not re-running".format(text))
+        from commands import tasks
+        if tasks.status() != "No task is running.":
+            actions = [{"action": "task_status"}]   # it's the one Jarvis is running
+        else:
+            actions = [{"action": "app_status", "target": "terminal", "question": text}]
+        mode = "command"
     kinds_here = {a.get("action") for a in actions if isinstance(a, dict)}
     if remote is not None:
         blocked = {telegram_bot.REMOTE_BLOCKED[k] for k in kinds_here

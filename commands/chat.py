@@ -489,6 +489,10 @@ def remember(user_text, assistant_text):
     if not user_text and not assistant_text:
         return
     with _history_lock:
+        # answer() saves its own turns, and the router's remember() passes
+        # every turn on here too -- don't store a chat answer twice.
+        if _history and _history[-1]["assistant"] == (assistant_text or "").strip():
+            return
         _history.append({
             "user": (user_text or "").strip(),
             "assistant": (assistant_text or "").strip(),

@@ -53,6 +53,7 @@ THINKING = os.getenv("SCREEN_THINKING", "minimal").strip().lower() or "minimal"
 # Longest edge of the image sent to the model.
 MAX_SIZE = 1024
 JPEG_QUALITY = 60
+UIA_TIMEOUT = 6.0   # seconds to wait for a window to list its password boxes
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +131,8 @@ def password_rects(window, bounds):
     if not window:
         return []
     from commands import uia
-    snap = uia.snapshot(window["hwnd"], bounds, max_items=0)
+    snap = uia.bounded(lambda: uia.snapshot(window["hwnd"], bounds, max_items=0),
+                       UIA_TIMEOUT, {"elements": []})
     return [e["rect"] for e in snap["elements"] if e["password"]]
 
 

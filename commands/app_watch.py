@@ -58,6 +58,7 @@ MAX_WATCH_SECONDS = 4 * 3600
 MAX_MODEL_CHECKS = 25        # per watch
 MAX_WATCHES = 3
 TEXT_TAIL = 4000             # characters of window text sent with the picture
+UIA_TIMEOUT = 6.0            # seconds a window gets to report its text / password boxes
 
 PW_RENDERFULLCONTENT = 2
 SW_SHOWNOACTIVATE = 4
@@ -72,21 +73,52 @@ FINISHED = {"waiting", "done", "error", "idle"}
 # Finding the window
 # ---------------------------------------------------------------------------
 
-def find(target):
-    """window_info() dict for the best window matching `target`, or None."""
-    from commands import desktop, window_actions as wa
+_TERMINAL_WORDS = {"terminal", "the terminal", "my terminal", "command prompt", "cmd",
+                   "powershell", "console", "shell", "command line", "windows terminal"}
+_TERMINAL_PROCESSES = {"windowsterminal.exe", "openconsole.exe", "cmd.exe", "powershell.exe",
+                       "pwsh.exe", "conhost.exe", "wsl.exe", "mintty.exe", "alacritty.exe",
+                       "wezterm-gui.exe"}
+
+
+def _hint_words(hint):
+    """Distinctive words from what was said ("ExamSlingDesktop", "LOGIZON")
+    to pick the right window when several match."""
+    import re as _re
+    common = {"the", "that", "this", "what", "with", "command", "commands", "terminal",
+              "check", "help", "done", "finished", "running", "build", "folder", "from",
+              "have", "into", "there", "where", "which", "while", "your", "mine", "just"}
+    return {w.lower() for w in _re.findall(r"[A-Za-z0-9_.\-]{4,}", str(hint or ""))
+            if w.lower() not in common}
+
+
+def find(target, hint=""):
+    """window_info() dict for the best window matching `target`, or None.
+
+    "terminal" also covers VS Code, whose built-in terminal is where a lot of
+    commands actually run. `hint` (the user's words) breaks ties: a window
+    whose title mentions a folder or project they named wins."""
+    from commands import desktop, identity, window_actions as wa
     target = str(target or "").strip()
     if not target:
         return None
     try:
         hits = wa.find_windows(target)
+        terminalish = target.lower() in _TERMINAL_WORDS
+        if terminalish:
+            windows = wa.enumerate_windows()
+            extra = [w for w in windows if w.process in _TERMINAL_PROCESSES]
+            extra += [w for w in windows if w.process == "code.exe"]
+            hits += [w for w in extra if w not in hits]
     except Exception as e:
         print("app_watch: couldn't list windows ({})".format(e))
         return None
     # Jarvis's own console (titled with its name) when it runs inside
     # Windows Terminal -- "what's my terminal doing" means another one.
-    from commands import identity
     hits = [w for w in hits if w.title.strip().lower() != identity.NAME.lower()]
+    words = _hint_words(hint)
+    if words:
+        named = [w for w in hits if any(word in w.title.lower() for word in words)]
+        hits = named + [w for w in hits if w not in named]
     return desktop.window_info(hits[0].hwnd) if hits else None
 
 
@@ -249,7 +281,8 @@ def capture(window, mask_passwords=True):
         if mask_passwords:
             from commands import screen_actions, uia
             try:
-                snap = uia.snapshot(hwnd, rect, max_items=0)
+                snap = uia.bounded(lambda: uia.snapshot(hwnd, rect, max_items=0),
+                                   UIA_TIMEOUT, {"elements": []})
                 screen_actions.mask(img, [e["rect"] for e in snap["elements"] if e["password"]], rect)
             except Exception:
                 pass
@@ -311,7 +344,13 @@ def scrub(text):
 
 def window_text(window):
     """The window's text as UI Automation reports it: a terminal or editor
-    buffer when there is one, plus visible labels. Tail-trimmed, scrubbed."""
+    buffer when there is one, plus visible labels. Tail-trimmed, scrubbed.
+    "" if the window doesn't answer within UIA_TIMEOUT."""
+    from commands import uia
+    return uia.bounded(lambda: _window_text(window), UIA_TIMEOUT, "")
+
+
+def _window_text(window):
     from commands import uia
     hwnd = window["hwnd"]
     parts = []
@@ -404,8 +443,16 @@ def _look(window, question):
 
 def status(target, question=""):
     """Spoken answer to "is Claude done?" / "what's my terminal doing?"."""
-    window = find(target)
+    window = find(target, hint=question)
     if window is None:
+        # "Is it done?" while Jarvis itself is running a command: that's
+        # what they mean.
+        try:
+            from commands import tasks
+            if tasks.status() != "No task is running.":
+                return tasks.status()
+        except Exception:
+            pass
         return "I can't find a {} window open.".format(target or "matching")
     question = (question or "").strip() or "What's happening in {} right now? Is it done?".format(target)
     try:
@@ -456,6 +503,11 @@ def _announce(line):
     try:
         from listener import telegram_bot
         telegram_bot.send(line)
+    except Exception:
+        pass
+    try:
+        from commands import parser
+        parser.remember_event(line)
     except Exception:
         pass
 
