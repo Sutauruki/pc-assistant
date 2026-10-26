@@ -70,6 +70,7 @@ TOTAL_DEADLINE = 22.0
 # started after 9 seconds is not going to finish in time to be worth waiting on.
 FIRST_TOKEN_TIMEOUT = 9.0
 STREAM_TIMEOUT = 30.0
+ANSWER_HARD_LIMIT = 40.0   # seconds for one model's whole answer, start to end
 
 RATE_LIMIT_COOLDOWN = 90.0
 ERROR_COOLDOWN = 300.0
@@ -535,6 +536,10 @@ def _iter_sse(kind, lib, payload, deadline):
         timeout = (6.0, min(FIRST_TOKEN_TIMEOUT, read_timeout))
         response = lib.post(url, headers=headers, json=body,
                             stream=True, timeout=timeout)
+        # The event stream comes without a charset, and requests then falls
+        # back to Latin-1 -- which turns every dash and curly quote into
+        # "\u00e2\u20ac\u201d" garbage. It is UTF-8.
+        response.encoding = "utf-8"
         if response.status_code >= 400:
             raise _http_error(response.status_code, response.text)
         lines = response.iter_lines(decode_unicode=True)
@@ -674,11 +679,20 @@ def _ask_one(model, messages, on_sentence, deadline):
     buffer = ""
     spoken = []
     started = None
+    # Wall-clock cap on the whole answer. The per-chunk read timeout only
+    # catches a stream that stops; a busy free model that trickles a word
+    # every few seconds never trips it and can run for minutes.
+    hard_stop = time.time() + ANSWER_HARD_LIMIT
 
     for delta in _iter_sse(kind, lib, payload, deadline):
         if started is None:
             started = time.time()
         buffer += delta
+        if time.time() > hard_stop:
+            if not spoken and not buffer.strip():
+                raise TimeoutError("too slow")
+            print("chat: {} is too slow -- stopping the answer there".format(model))
+            break
 
         # Bail before the first word is spoken, not after. A classifier
         # announces itself in its opening tokens ("User Safety: ..."), and
@@ -699,9 +713,6 @@ def _ask_one(model, messages, on_sentence, deadline):
                     spoken.append(cleaned)
                     on_sentence(cleaned)
             continue
-
-        if time.time() > deadline + STREAM_TIMEOUT:
-            break
 
     tail = despeak(buffer)
     if tail:
